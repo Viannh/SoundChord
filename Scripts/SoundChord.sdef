@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<dictionary title="SoundChord Terminology">
+    <suite name="Standard Suite" code="????" description="Common classes and commands for all applications.">
+        <class name="application" code="capp" description="The application's top-level scripting object.">
+            <cocoa class="NSApplication"/>
+            <property name="name" code="pnam" type="text" access="r" description="The name of the application."/>
+            <property name="frontmost" code="pisf" type="boolean" access="r" description="Is this the active application?">
+                <cocoa key="isActive"/>
+            </property>
+            <property name="version" code="vers" type="text" access="r" description="The version number of the application."/>
+        </class>
+    </suite>
+
+    <suite name="SoundChord Suite" code="bChd" description="SoundChord playback state and media controls.">
+        <enumeration name="EPlS" code="EPlS" description="Playback state of the player.">
+            <enumerator name="stopped" code="kPSS" description="Playback is stopped."/>
+            <enumerator name="playing" code="kPSP" description="A track is currently playing."/>
+            <enumerator name="paused" code="kPSp" description="Playback is paused."/>
+        </enumeration>
+
+        <class name="track" code="cTrk" description="A SoundChord track.">
+            <cocoa class="SoundChordScriptableTrack"/>
+            <property name="id" code="ID  " type="text" access="r" description="The unique identifier of the track.">
+                <cocoa key="scriptTrackID"/>
+            </property>
+            <property name="name" code="pnam" type="text" access="r" description="The title of the track.">
+                <cocoa key="scriptTitle"/>
+            </property>
+            <property name="artist" code="pArt" type="text" access="r" description="The artist of the track.">
+                <cocoa key="scriptArtist"/>
+            </property>
+            <property name="album" code="pAlb" type="text" access="r" description="The album of the track.">
+                <cocoa key="scriptAlbum"/>
+            </property>
+            <property name="duration" code="pDur" type="integer" access="r" description="The length of the track in milliseconds.">
+                <cocoa key="scriptDurationMs"/>
+            </property>
+            <property name="artwork url" code="pArU" type="text" access="r" description="The URL of the track's cover artwork.">
+                <cocoa key="scriptArtworkURL"/>
+            </property>
+        </class>
+
+        <class-extension extends="application" description="SoundChord's top-level playback properties.">
+            <cocoa class="NSApplication"/>
+            <property name="current track" code="pTrk" type="track" access="r" description="The currently loaded track.">
+                <cocoa key="currentTrack"/>
+            </property>
+            <property name="player state" code="pPlS" type="EPlS" access="r" description="Is SoundChord stopped, paused, or playing?">
+                <cocoa key="playerState"/>
+            </property>
+            <property name="player position" code="pPos" type="real" access="rw" description="The player's position within the currently playing track in seconds.">
+                <cocoa key="playerPosition"/>
+            </property>
+            <property name="shuffling" code="pShf" type="boolean" access="rw" description="Is shuffling enabled?">
+                <cocoa key="shuffling"/>
+            </property>
+            <property name="shuffling enabled" code="pShE" type="boolean" access="r" description="Is shuffling supported in the current context?">
+                <cocoa key="shufflingEnabled"/>
+            </property>
+            <property name="repeating" code="pRep" type="boolean" access="rw" description="Is repeating enabled?">
+                <cocoa key="repeating"/>
+            </property>
+            <property name="repeating enabled" code="pRpE" type="boolean" access="r" description="Is repeating supported in the current context?">
+                <cocoa key="repeatingEnabled"/>
+            </property>
+            <property name="sound volume" code="pVol" type="integer" access="rw" description="The sound output volume (0 = minimum, 100 = maximum).">
+                <cocoa key="soundVolume"/>
+            </property>
+        </class-extension>
+
+        <command name="playpause" code="bChdPlPs" description="Toggle play/pause.">
+            <cocoa class="SoundChordPlayPauseCommand"/>
+        </command>
+
+        <command name="play" code="bChdPlay" description="Resume playback.">
+            <cocoa class="SoundChordPlayCommand"/>
+        </command>
+
+        <command name="pause" code="bChdPaus" description="Pause playback.">
+            <cocoa class="SoundChordPauseCommand"/>
+        </command>
+
+        <command name="next track" code="bChdNext" description="Skip to the next track.">
+            <cocoa class="SoundChordNextTrackCommand"/>
+        </command>
+
+        <command name="previous track" code="bChdPrev" description="Skip to the previous track.">
+            <cocoa class="SoundChordPreviousTrackCommand"/>
+        </command>
+    </suite>
+</dictionary>

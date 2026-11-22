@@ -1,0 +1,4 @@
+module CSoundChordDSP {
+    header "soundchord_dsp.h"
+    export *
+}

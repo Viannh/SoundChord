@@ -1,0 +1,12 @@
+# Build & packaging outputs
+.build/
+.swiftpm/
+RustDSP/target/
+dist/
+
+# Analysis & tooling artifacts
+graphify-out/
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store
