@@ -9,6 +9,7 @@ public struct MeshGradientBackground: View {
     public var vignetteOpacity: Double
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isVisible: Bool = true
 
     public init(
         colors: [Color],
@@ -32,15 +33,15 @@ public struct MeshGradientBackground: View {
         let c1 = palette[1]
         let c2 = palette[2]
         let c3 = palette[3]
-        let shouldAnimate = isAnimating && !reduceMotion
+        let shouldAnimate = isAnimating && isVisible && !reduceMotion
 
         ZStack {
             // Deep base underneath so edges never flash
             c0.opacity(0.35)
                 .background(Color.black)
 
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !shouldAnimate)) { timeline in
-                let t = shouldAnimate ? timeline.date.timeIntervalSinceReferenceDate : 0.0
+            TimelineView(.animation(paused: !shouldAnimate)) { timeline in
+                let t = reduceMotion ? 0.0 : timeline.date.timeIntervalSinceReferenceDate
                 let points = animatedControlPoints(at: t)
                 let meshColors: [Color] = [
                     c0,
@@ -61,8 +62,7 @@ public struct MeshGradientBackground: View {
                     colors: meshColors,
                     smoothsColors: true
                 )
-                .scaleEffect(1.18)
-                .blur(radius: 28)
+                .scaleEffect(1.14)
                 .animation(.easeInOut(duration: 1.4), value: colors)
             }
 
@@ -88,7 +88,14 @@ public struct MeshGradientBackground: View {
             )
         }
         .clipped()
+        .drawingGroup(opaque: true)
         .ignoresSafeArea()
+        .onAppear {
+            isVisible = true
+        }
+        .onDisappear {
+            isVisible = false
+        }
     }
 
     /// Computes a 3x3 grid of control points whose interior and edge midpoints drift

@@ -35,7 +35,7 @@ public struct SearchView: View {
     public var body: some View {
         ZStack(alignment: .top) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
+                LazyVStack(alignment: .leading, spacing: 24) {
                     // Header + Centered Pill Search Field
                     VStack(alignment: .leading, spacing: 18) {
                         Text("Search")
@@ -264,7 +264,7 @@ public struct SearchView: View {
                     }
 
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
+                        LazyHStack(spacing: 8) {
                             ForEach(appState.libraryStore.searchHistory, id: \.self) { query in
                                 Button {
                                     submitSearch(query)
@@ -804,6 +804,7 @@ private struct SearchCategoryTile: View {
     let color: Color
     let icon: String
     let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovered = false
 
     var body: some View {
@@ -832,13 +833,17 @@ private struct SearchCategoryTile: View {
                 RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous)
                     .strokeBorder(Color.white.opacity(isHovered ? 0.28 : 0.12), lineWidth: 1)
             )
-            .shadow(color: color.opacity(isHovered ? 0.28 : 0.12), radius: isHovered ? 10 : 4, y: 3)
-            .scaleEffect(isHovered ? 1.02 : 1.0)
+            .shadow(color: color.opacity(0.16), radius: 5, y: 3)
+            .scaleEffect(isHovered && !reduceMotion ? 1.02 : 1.0)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
+            if reduceMotion {
                 isHovered = hovering
+            } else {
+                withAnimation(.easeOut(duration: 0.11)) {
+                    isHovered = hovering
+                }
             }
         }
     }

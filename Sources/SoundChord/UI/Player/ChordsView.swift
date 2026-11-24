@@ -5,6 +5,7 @@ import SwiftUI
 public struct ChordsView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public let compact: Bool
 
@@ -15,6 +16,7 @@ public struct ChordsView: View {
     @State private var autoScroll: Bool = true
     @State private var isLoopPickingMode: Bool = false
     @State private var loopPickAnchorBeat: BeatChordCell? = nil
+    @State private var cachedFallbackBeats: [BeatChordCell] = []
 
     public init(compact: Bool = false) {
         self.compact = compact
@@ -101,47 +103,28 @@ public struct ChordsView: View {
         max(1, activeTimeline?.beatsPerBar ?? 4)
     }
 
+    private struct FallbackBeatsCacheKey: Equatable {
+        let trackId: String
+        let analyzedAt: Date?
+        let segmentCount: Int
+        let beatCount: Int
+    }
+
+    private var fallbackBeatsCacheKey: FallbackBeatsCacheKey {
+        FallbackBeatsCacheKey(
+            trackId: activeTimeline?.trackId ?? "",
+            analyzedAt: activeTimeline?.analyzedAt,
+            segmentCount: activeTimeline?.segments.count ?? 0,
+            beatCount: activeTimeline?.beats.count ?? 0
+        )
+    }
+
     private var effectiveBeats: [BeatChordCell] {
         guard let timeline = activeTimeline else { return [] }
         if !timeline.beats.isEmpty {
             return timeline.beats
         }
-        return synthesizeFallbackBeats(from: timeline)
-    }
-
-    private var activeBeatIndex: Int? {
-        let beats = effectiveBeats
-        guard !beats.isEmpty else { return nil }
-        if let timeline = activeTimeline, !timeline.beats.isEmpty {
-            return timeline.beatIndex(at: audio.currentTime)
-        }
-        let t = max(0, audio.currentTime)
-        if let idx = beats.firstIndex(where: { t >= $0.startTime && t < $0.endTime }) {
-            return idx
-        }
-        if let last = beats.last, t >= last.startTime && t <= last.endTime + 0.05 {
-            return beats.count - 1
-        }
-        return nil
-    }
-
-    private var activeBeat: BeatChordCell? {
-        guard let idx = activeBeatIndex, effectiveBeats.indices.contains(idx) else { return nil }
-        return effectiveBeats[idx]
-    }
-
-    private var activeSegment: TimedChordSegment? {
-        activeTimeline?.segment(at: audio.currentTime)
-    }
-
-    private var activeChord: DetectedChord? {
-        if let beatChord = activeBeat?.chord {
-            return beatChord.transposed(by: transpose)
-        }
-        if let segChord = activeSegment?.chord {
-            return segChord.transposed(by: transpose)
-        }
-        return audio.currentChord?.transposed(by: transpose)
+        return cachedFallbackBeats
     }
 
     private var displayedKey: String? {
@@ -171,6 +154,13 @@ public struct ChordsView: View {
         .onChange(of: currentTrack?.id) { _, _ in
             isLoopPickingMode = false
             loopPickAnchorBeat = nil
+        }
+        .task(id: fallbackBeatsCacheKey) {
+            if let timeline = activeTimeline, timeline.beats.isEmpty, !timeline.segments.isEmpty {
+                cachedFallbackBeats = synthesizeFallbackBeats(from: timeline)
+            } else {
+                cachedFallbackBeats = []
+            }
         }
         .task(id: currentTrack?.id) {
             guard let track = currentTrack, !isHLSStream else { return }
@@ -206,11 +196,10 @@ public struct ChordsView: View {
 
             if viewMode == .chordsOverLyrics || viewMode == .chordDiagrams {
                 LiveBeatStripView(
+                    timeline: activeTimeline,
                     beats: effectiveBeats,
                     beatsPerBar: effectiveBeatsPerBar,
-                    activeBeatIndex: activeBeatIndex,
-                    currentTime: audio.currentTime,
-                    isPlaying: audio.isPlaying,
+                    anchor: audio.playbackAnchor,
                     transpose: transpose,
                     loopRange: audio.loopRange,
                     autoScroll: autoScroll,
@@ -492,8 +481,7 @@ public struct ChordsView: View {
                 isLoadingLyrics: appState.isLoadingLyrics,
                 showTranslatedLyrics: appState.showTranslatedLyrics,
                 lyricsOffsetSeconds: lyricsOffsetSeconds,
-                currentTime: audio.currentTime,
-                activeSegmentId: activeSegment?.id,
+                anchor: audio.playbackAnchor,
                 transpose: transpose,
                 selectedInstrument: selectedInstrument,
                 lyricScale: lyricScale,
@@ -507,11 +495,11 @@ public struct ChordsView: View {
         case .chordDiagrams:
             ChordDiagramsView(
                 timeline: activeTimeline,
+                beats: effectiveBeats,
                 diagramsMode: diagramsMode,
                 selectedInstrument: selectedInstrument,
-                currentTime: audio.currentTime,
-                activeSegment: activeSegment,
-                activeChord: activeChord,
+                anchor: audio.playbackAnchor,
+                liveFallbackChord: audio.currentChord?.transposed(by: transpose),
                 transpose: transpose,
                 compact: compact,
                 onSeek: { t in audio.seek(to: t) }
@@ -522,9 +510,7 @@ public struct ChordsView: View {
                 timeline: activeTimeline,
                 beats: effectiveBeats,
                 beatsPerBar: effectiveBeatsPerBar,
-                activeBeatIndex: activeBeatIndex,
-                currentTime: audio.currentTime,
-                isPlaying: audio.isPlaying,
+                anchor: audio.playbackAnchor,
                 transpose: transpose,
                 loopRange: audio.loopRange,
                 isLoopPickingMode: isLoopPickingMode,
@@ -555,7 +541,8 @@ public struct ChordsView: View {
             loopPickAnchorBeat = nil
             return
         }
-        let currentIdx = activeBeatIndex ?? 0
+        let now = audio.playbackAnchor.interpolatedTime()
+        let currentIdx = ChordPlaybackLookup.beatIndex(at: now, in: beats, timeline: activeTimeline) ?? 0
         let currentBar = beats[currentIdx].barIndex
         let barBeats = beats.filter { $0.barIndex >= currentBar && $0.barIndex < currentBar + 4 }
         if let first = barBeats.first, let last = barBeats.last {
@@ -1093,16 +1080,96 @@ private struct ChordFeatureToolbar: View {
     }
 }
 
+// MARK: - Fast O(log N) Playback Lookups
+
+private enum ChordPlaybackLookup {
+    static func beatIndex(
+        at time: TimeInterval,
+        in beats: [BeatChordCell],
+        timeline: TrackChordTimeline?
+    ) -> Int? {
+        guard !beats.isEmpty, time.isFinite else { return nil }
+        if let timeline, !timeline.beats.isEmpty {
+            return timeline.beatIndex(at: time)
+        }
+        let t = max(0, time)
+        var low = 0
+        var high = beats.count - 1
+        while low <= high {
+            let mid = low + (high - low) / 2
+            let beat = beats[mid]
+            if t < beat.startTime {
+                high = mid - 1
+            } else if t >= beat.endTime {
+                if mid == beats.count - 1 && t <= beat.endTime + 0.05 {
+                    return mid
+                }
+                low = mid + 1
+            } else {
+                return mid
+            }
+        }
+        return nil
+    }
+
+    static func activeChordLyricRowId(in rows: [ChordLyricRow], at time: TimeInterval) -> String? {
+        guard !rows.isEmpty, time.isFinite else { return nil }
+        let t = max(0, time)
+        var low = 0
+        var high = rows.count - 1
+        var latestIdx: Int?
+        while low <= high {
+            let mid = low + (high - low) / 2
+            let row = rows[mid]
+            if t >= row.startTime - 0.05 && t < row.endTime {
+                return row.id
+            }
+            if row.startTime <= t + 0.08 {
+                latestIdx = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        if let latestIdx {
+            return rows[latestIdx].id
+        }
+        return rows.first?.id
+    }
+
+    static func activeChangeSegmentIndex(in segments: [TimedChordSegment], at time: TimeInterval) -> Int {
+        guard !segments.isEmpty, time.isFinite else { return 0 }
+        let t = max(0, time)
+        var low = 0
+        var high = segments.count - 1
+        var latestIdx = 0
+        while low <= high {
+            let mid = low + (high - low) / 2
+            let seg = segments[mid]
+            if t >= seg.startTime && t < seg.endTime {
+                return mid
+            }
+            if seg.startTime <= t {
+                latestIdx = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return latestIdx
+    }
+}
+
 // MARK: - Single-Row Live Beat Strip (54x52 Tiles + 2pt Barlines)
 
 private struct LiveBeatStripView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    let timeline: TrackChordTimeline?
     let beats: [BeatChordCell]
     let beatsPerBar: Int
-    let activeBeatIndex: Int?
-    let currentTime: TimeInterval
-    let isPlaying: Bool
+    let anchor: PlaybackAnchor
     let transpose: Int
     let loopRange: ClosedRange<TimeInterval>?
     let autoScroll: Bool
@@ -1136,48 +1203,83 @@ private struct LiveBeatStripView: View {
                 .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(cardBg))
                 .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(border, lineWidth: 1))
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(spacing: 4) {
-                            ForEach(Array(beats.enumerated()), id: \.element.id) { index, beat in
-                                if index > 0 && beat.beatIndex == 0 {
-                                    Rectangle()
-                                        .fill(colorScheme == .dark ? Color.white.opacity(0.24) : Color.black.opacity(0.22))
-                                        .frame(width: 2, height: 48)
-                                        .padding(.horizontal, 2)
-                                }
+                PlaybackTimeline(anchor: anchor) { liveTime in
+                    let activeIdx = ChordPlaybackLookup.beatIndex(at: liveTime, in: beats, timeline: timeline)
+                    LiveBeatStripScrollContent(
+                        beats: beats,
+                        activeBeatIndex: activeIdx,
+                        currentTime: liveTime,
+                        isPlaying: anchor.isPlaying,
+                        transpose: transpose,
+                        loopRange: loopRange,
+                        autoScroll: autoScroll,
+                        reduceMotion: reduceMotion,
+                        onSeekBeat: onSeekBeat
+                    )
+                }
+                .frame(height: 64)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(cardBg))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(border, lineWidth: 1))
+            }
+        }
+    }
+}
 
-                                let isCurrent = (activeBeatIndex == index)
-                                let isLooped = loopRange.map { $0.overlaps(beat.startTime...beat.endTime) } ?? false
-                                let beatProgress: Double = {
-                                    guard isCurrent else { return 0 }
-                                    let span = max(0.05, beat.endTime - beat.startTime)
-                                    return min(1.0, max(0.0, (currentTime - beat.startTime) / span))
-                                }()
+private struct LiveBeatStripScrollContent: View {
+    @Environment(\.colorScheme) private var colorScheme
 
-                                BeatStripTile(
-                                    beat: beat,
-                                    isCurrent: isCurrent,
-                                    isPlaying: isPlaying,
-                                    isLooped: isLooped,
-                                    progress: beatProgress,
-                                    transpose: transpose,
-                                    onTap: { onSeekBeat(beat) }
-                                )
-                                .id(beat.id)
-                            }
+    let beats: [BeatChordCell]
+    let activeBeatIndex: Int?
+    let currentTime: TimeInterval
+    let isPlaying: Bool
+    let transpose: Int
+    let loopRange: ClosedRange<TimeInterval>?
+    let autoScroll: Bool
+    let reduceMotion: Bool
+    let onSeekBeat: (BeatChordCell) -> Void
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 4) {
+                    ForEach(Array(beats.enumerated()), id: \.element.id) { index, beat in
+                        if index > 0 && beat.beatIndex == 0 {
+                            Rectangle()
+                                .fill(colorScheme == .dark ? Color.white.opacity(0.24) : Color.black.opacity(0.22))
+                                .frame(width: 2, height: 48)
+                                .padding(.horizontal, 2)
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
+
+                        let isCurrent = (activeBeatIndex == index)
+                        let isLooped = loopRange.map { $0.overlaps(beat.startTime...beat.endTime) } ?? false
+                        let beatProgress: Double = {
+                            guard isCurrent else { return 0 }
+                            let span = max(0.05, beat.endTime - beat.startTime)
+                            return min(1.0, max(0.0, (currentTime - beat.startTime) / span))
+                        }()
+
+                        BeatStripTile(
+                            beat: beat,
+                            isCurrent: isCurrent,
+                            isPlaying: isPlaying,
+                            isLooped: isLooped,
+                            progress: beatProgress,
+                            transpose: transpose,
+                            onTap: { onSeekBeat(beat) }
+                        )
+                        .id(beat.id)
                     }
-                    .frame(height: 64)
-                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(cardBg))
-                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(border, lineWidth: 1))
-                    .onChange(of: activeBeatIndex) { _, newIdx in
-                        guard autoScroll, let newIdx, beats.indices.contains(newIdx) else { return }
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            proxy.scrollTo(beats[newIdx].id, anchor: .center)
-                        }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            .onChange(of: activeBeatIndex) { _, newIdx in
+                guard autoScroll, let newIdx, beats.indices.contains(newIdx) else { return }
+                if reduceMotion {
+                    proxy.scrollTo(beats[newIdx].id, anchor: .center)
+                } else {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        proxy.scrollTo(beats[newIdx].id, anchor: .center)
                     }
                 }
             }
@@ -1249,12 +1351,11 @@ private struct BeatStripTile: View {
                 .frame(width: 54, height: 52)
 
                 if isCurrent {
-                    GeometryReader { geo in
-                        let w = max(2, geo.size.width * progress)
-                        ZStack(alignment: .leading) {
-                            Rectangle().fill(barFill.opacity(0.25))
-                            Rectangle().fill(barFill).frame(width: w)
-                        }
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(barFill.opacity(0.25))
+                        Rectangle()
+                            .fill(barFill)
+                            .scaleEffect(x: max(0.02, CGFloat(progress)), y: 1.0, anchor: .leading)
                     }
                     .frame(height: 3)
                 } else if isLooped {
@@ -1284,6 +1385,7 @@ private struct BeatStripTile: View {
 
 private struct ChordOverLyricsView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let timeline: TrackChordTimeline?
     let beats: [BeatChordCell]
@@ -1291,8 +1393,7 @@ private struct ChordOverLyricsView: View {
     let isLoadingLyrics: Bool
     let showTranslatedLyrics: Bool
     let lyricsOffsetSeconds: TimeInterval
-    let currentTime: TimeInterval
-    let activeSegmentId: UUID?
+    let anchor: PlaybackAnchor
     let transpose: Int
     let selectedInstrument: ChordsView.ChordInstrument
     let lyricScale: CGFloat
@@ -1301,6 +1402,37 @@ private struct ChordOverLyricsView: View {
     let onSeek: (TimeInterval) -> Void
     let onRetryLyrics: () -> Void
     let onSwitchToGrid: () -> Void
+
+    @State private var cachedAlignedRows: [ChordLyricRow] = []
+
+    private struct AlignmentCacheKey: Equatable {
+        let lyricsTrackId: String
+        let lyricsProvider: String
+        let lyricsLineCount: Int
+        let lyricsFirstLineId: String
+        let lyricsTranslatedCount: Int
+        let timelineTrackId: String
+        let timelineAnalyzedAt: Date?
+        let timelineSegmentCount: Int
+        let offsetMs: Int
+    }
+
+    private var alignmentCacheKey: AlignmentCacheKey {
+        let translatedCount = lyrics?.lines.reduce(0) { count, line in
+            count + ((line.translatedText?.isEmpty == false) ? 1 : 0)
+        } ?? 0
+        return AlignmentCacheKey(
+            lyricsTrackId: lyrics?.trackId ?? "",
+            lyricsProvider: lyrics?.provider ?? "",
+            lyricsLineCount: lyrics?.lines.count ?? 0,
+            lyricsFirstLineId: lyrics?.lines.first?.id ?? "",
+            lyricsTranslatedCount: translatedCount,
+            timelineTrackId: timeline?.trackId ?? "",
+            timelineAnalyzedAt: timeline?.analyzedAt,
+            timelineSegmentCount: timeline?.segments.count ?? 0,
+            offsetMs: Int((lyricsOffsetSeconds * 1000.0).rounded())
+        )
+    }
 
     private var uniqueDisplayedChords: [DetectedChord] {
         guard let timeline else { return [] }
@@ -1326,11 +1458,29 @@ private struct ChordOverLyricsView: View {
 
             Group {
                 if let lyrics, !lyrics.lines.isEmpty, let timeline {
-                    alignedLyricsScroll(lyrics: lyrics, timeline: timeline)
+                    AlignedLyricsTimelineView(
+                        rows: cachedAlignedRows,
+                        timeline: timeline,
+                        anchor: anchor,
+                        showTranslatedLyrics: showTranslatedLyrics,
+                        transpose: transpose,
+                        lyricScale: lyricScale,
+                        autoScroll: autoScroll,
+                        compact: compact,
+                        reduceMotion: reduceMotion,
+                        onSeek: onSeek
+                    )
                 } else if isLoadingLyrics {
                     loadingLyricsPlaceholder
                 } else if let timeline, !timeline.segments.isEmpty {
-                    instrumentalSectionsFallback(timeline: timeline)
+                    InstrumentalSectionsTimelineView(
+                        timeline: timeline,
+                        anchor: anchor,
+                        transpose: transpose,
+                        compact: compact,
+                        onSeek: onSeek,
+                        onRetryLyrics: onRetryLyrics
+                    )
                 } else {
                     emptyLyricsAndTimelineFallback
                 }
@@ -1338,6 +1488,17 @@ private struct ChordOverLyricsView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous).fill(cardBg))
             .overlay(RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous).strokeBorder(border, lineWidth: 1))
+        }
+        .task(id: alignmentCacheKey) {
+            guard let lyrics, !lyrics.lines.isEmpty, let timeline else {
+                cachedAlignedRows = []
+                return
+            }
+            cachedAlignedRows = LyricsChordAligner.align(
+                lyrics: lyrics,
+                timeline: timeline,
+                lyricsOffsetSeconds: lyricsOffsetSeconds
+            )
         }
     }
 
@@ -1347,7 +1508,7 @@ private struct ChordOverLyricsView: View {
         let primary = SoundChordTheme.primaryText(for: colorScheme)
 
         return ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+            LazyHStack(spacing: 8) {
                 ForEach(uniqueDisplayedChords, id: \.displayName) { chord in
                     Button {
                         if let first = timeline?.segments.first(where: { $0.chord.transposed(by: transpose).displayName == chord.displayName }) {
@@ -1376,15 +1537,110 @@ private struct ChordOverLyricsView: View {
         }
     }
 
-    private func alignedLyricsScroll(lyrics: LyricsDocument, timeline: TrackChordTimeline) -> some View {
-        let rows = LyricsChordAligner.align(
-            lyrics: lyrics,
-            timeline: timeline,
-            lyricsOffsetSeconds: lyricsOffsetSeconds
-        )
-        let currentActiveRowId = activeChordLyricRowId(in: rows, at: currentTime)
+    private var loadingLyricsPlaceholder: some View {
+        VStack(spacing: 10) {
+            Spacer()
+            ProgressView()
+                .controlSize(.regular)
+                .tint(SoundChordTheme.accentColor(for: colorScheme))
+            Text("Fetching synced lyrics...")
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(SoundChordTheme.secondaryText(for: colorScheme))
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-        return ScrollViewReader { proxy in
+    private var emptyLyricsAndTimelineFallback: some View {
+        let secondary = SoundChordTheme.secondaryText(for: colorScheme)
+        let accent = SoundChordTheme.accentColor(for: colorScheme)
+        let accentFg = SoundChordTheme.accentForeground(for: colorScheme)
+
+        return VStack(spacing: 10) {
+            Spacer()
+            Image(systemName: "music.note.list")
+                .font(.system(size: 28, weight: .light))
+                .foregroundStyle(secondary.opacity(0.75))
+            Text("Chords and lyrics will appear here once analysis completes.")
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 20)
+
+            HStack(spacing: 8) {
+                Button(action: onSwitchToGrid) {
+                    Text("Open Chords Grid")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(accentFg)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(accent))
+                }
+                .buttonStyle(.plain)
+
+                Button("Retry Lyrics", action: onRetryLyrics)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct AlignedLyricsTimelineView: View {
+    let rows: [ChordLyricRow]
+    let timeline: TrackChordTimeline
+    let anchor: PlaybackAnchor
+    let showTranslatedLyrics: Bool
+    let transpose: Int
+    let lyricScale: CGFloat
+    let autoScroll: Bool
+    let compact: Bool
+    let reduceMotion: Bool
+    let onSeek: (TimeInterval) -> Void
+
+    var body: some View {
+        PlaybackTimeline(anchor: anchor) { liveTime in
+            let activeSegId = timeline.segment(at: liveTime)?.id
+            let activeRowId = ChordPlaybackLookup.activeChordLyricRowId(in: rows, at: liveTime)
+
+            AlignedLyricsScrollContent(
+                rows: rows,
+                timeline: timeline,
+                currentTime: liveTime,
+                activeSegmentId: activeSegId,
+                currentActiveRowId: activeRowId,
+                showTranslatedLyrics: showTranslatedLyrics,
+                transpose: transpose,
+                lyricScale: lyricScale,
+                autoScroll: autoScroll,
+                compact: compact,
+                reduceMotion: reduceMotion,
+                onSeek: onSeek
+            )
+        }
+    }
+}
+
+private struct AlignedLyricsScrollContent: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let rows: [ChordLyricRow]
+    let timeline: TrackChordTimeline
+    let currentTime: TimeInterval
+    let activeSegmentId: UUID?
+    let currentActiveRowId: String?
+    let showTranslatedLyrics: Bool
+    let transpose: Int
+    let lyricScale: CGFloat
+    let autoScroll: Bool
+    let compact: Bool
+    let reduceMotion: Bool
+    let onSeek: (TimeInterval) -> Void
+
+    var body: some View {
+        ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: true) {
                 LazyVStack(alignment: .leading, spacing: compact ? 12 : 14) {
                     ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
@@ -1405,8 +1661,12 @@ private struct ChordOverLyricsView: View {
             }
             .onChange(of: currentActiveRowId) { _, newId in
                 guard autoScroll, let newId else { return }
-                withAnimation(.easeInOut(duration: 0.35)) {
+                if reduceMotion {
                     proxy.scrollTo(newId, anchor: UnitPoint(x: 0.5, y: 0.28))
+                } else {
+                    withAnimation(.easeInOut(duration: 0.35)) {
+                        proxy.scrollTo(newId, anchor: UnitPoint(x: 0.5, y: 0.28))
+                    }
                 }
             }
         }
@@ -1463,134 +1723,83 @@ private struct ChordOverLyricsView: View {
             )
         }
     }
+}
 
-    private func instrumentalSectionsFallback(timeline: TrackChordTimeline) -> some View {
+private struct InstrumentalSectionsTimelineView: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let timeline: TrackChordTimeline
+    let anchor: PlaybackAnchor
+    let transpose: Int
+    let compact: Bool
+    let onSeek: (TimeInterval) -> Void
+    let onRetryLyrics: () -> Void
+
+    var body: some View {
         let primary = SoundChordTheme.primaryText(for: colorScheme)
         let secondary = SoundChordTheme.secondaryText(for: colorScheme)
         let accent = SoundChordTheme.accentColor(for: colorScheme)
 
-        return ScrollView(.vertical, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Text("No synced lyrics available for this track. Follow the chord progression by section below.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(secondary)
-                    Spacer()
-                    Button("Retry Lyrics", action: onRetryLyrics)
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                }
+        return PlaybackTimeline(anchor: anchor) { currentTime in
+            let activeSegmentId = timeline.segment(at: currentTime)?.id
 
-                if timeline.sections.isEmpty {
-                    ChordTokenFlowLayout(horizontalSpacing: 6, verticalSpacing: 8) {
-                        ForEach(timeline.segments) { seg in
-                            Button {
-                                onSeek(seg.startTime)
-                            } label: {
-                                let isSegActive = seg.id == activeSegmentId
-                                ChordSymbolText(
-                                    chord: seg.chord.transposed(by: transpose),
-                                    rootSize: 13,
-                                    color: isSegActive ? SoundChordTheme.accentForeground(for: colorScheme) : primary
-                                )
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(isSegActive ? accent : SoundChordTheme.elevatedBackground(for: colorScheme))
-                                )
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        Text("No synced lyrics available for this track. Follow the chord progression by section below.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(secondary)
+                        Spacer()
+                        Button("Retry Lyrics", action: onRetryLyrics)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+
+                    if timeline.sections.isEmpty {
+                        ChordTokenFlowLayout(horizontalSpacing: 6, verticalSpacing: 8) {
+                            ForEach(timeline.segments) { seg in
+                                Button {
+                                    onSeek(seg.startTime)
+                                } label: {
+                                    let isSegActive = seg.id == activeSegmentId
+                                    ChordSymbolText(
+                                        chord: seg.chord.transposed(by: transpose),
+                                        rootSize: 13,
+                                        color: isSegActive ? SoundChordTheme.accentForeground(for: colorScheme) : primary
+                                    )
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .fill(isSegActive ? accent : SoundChordTheme.elevatedBackground(for: colorScheme))
+                                    )
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
+                        }
+                    } else {
+                        ForEach(timeline.sections) { section in
+                            let sectionSegs = timeline.segments.filter {
+                                $0.endTime > section.startTime && $0.startTime < section.endTime
+                            }
+                            InstrumentalChordRowView(
+                                label: section.label,
+                                startTime: section.startTime,
+                                endTime: section.endTime,
+                                segments: sectionSegs,
+                                transpose: transpose,
+                                currentTime: currentTime,
+                                activeSegmentId: activeSegmentId,
+                                isActiveRow: currentTime >= section.startTime && currentTime < section.endTime,
+                                compact: compact,
+                                onSeek: onSeek
+                            )
                         }
                     }
-                } else {
-                    ForEach(timeline.sections) { section in
-                        let sectionSegs = timeline.segments.filter {
-                            $0.endTime > section.startTime && $0.startTime < section.endTime
-                        }
-                        InstrumentalChordRowView(
-                            label: section.label,
-                            startTime: section.startTime,
-                            endTime: section.endTime,
-                            segments: sectionSegs,
-                            transpose: transpose,
-                            currentTime: currentTime,
-                            activeSegmentId: activeSegmentId,
-                            isActiveRow: currentTime >= section.startTime && currentTime < section.endTime,
-                            compact: compact,
-                            onSeek: onSeek
-                        )
-                    }
                 }
-            }
-            .padding(14)
-        }
-    }
-
-    private var loadingLyricsPlaceholder: some View {
-        VStack(spacing: 10) {
-            Spacer()
-            ProgressView()
-                .controlSize(.regular)
-                .tint(SoundChordTheme.accentColor(for: colorScheme))
-            Text("Fetching synced lyrics...")
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(SoundChordTheme.secondaryText(for: colorScheme))
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var emptyLyricsAndTimelineFallback: some View {
-        let secondary = SoundChordTheme.secondaryText(for: colorScheme)
-        let accent = SoundChordTheme.accentColor(for: colorScheme)
-        let accentFg = SoundChordTheme.accentForeground(for: colorScheme)
-
-        return VStack(spacing: 10) {
-            Spacer()
-            Image(systemName: "music.note.list")
-                .font(.system(size: 28, weight: .light))
-                .foregroundStyle(secondary.opacity(0.75))
-            Text("Chords and lyrics will appear here once analysis completes.")
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 20)
-
-            HStack(spacing: 8) {
-                Button(action: onSwitchToGrid) {
-                    Text("Open Chords Grid")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(accentFg)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Capsule().fill(accent))
-                }
-                .buttonStyle(.plain)
-
-                Button("Retry Lyrics", action: onRetryLyrics)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            }
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func activeChordLyricRowId(in rows: [ChordLyricRow], at time: TimeInterval) -> String? {
-        guard !rows.isEmpty else { return nil }
-        if let exact = rows.first(where: { time >= $0.startTime - 0.05 && time < $0.endTime }) {
-            return exact.id
-        }
-        var latest: String?
-        for row in rows {
-            if row.startTime <= time + 0.08 {
-                latest = row.id
-            } else {
-                break
+                .padding(14)
             }
         }
-        return latest ?? rows.first?.id
     }
 }
 
@@ -1598,13 +1807,14 @@ private struct ChordOverLyricsView: View {
 
 private struct ChordDiagramsView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let timeline: TrackChordTimeline?
+    let beats: [BeatChordCell]
     let diagramsMode: ChordsView.ChordDiagramsSubMode
     let selectedInstrument: ChordsView.ChordInstrument
-    let currentTime: TimeInterval
-    let activeSegment: TimedChordSegment?
-    let activeChord: DetectedChord?
+    let anchor: PlaybackAnchor
+    let liveFallbackChord: DetectedChord?
     let transpose: Int
     let compact: Bool
     let onSeek: (TimeInterval) -> Void
@@ -1626,15 +1836,29 @@ private struct ChordDiagramsView: View {
         return result
     }
 
+    private func resolvedActiveChord(at time: TimeInterval) -> DetectedChord? {
+        if let beatIdx = ChordPlaybackLookup.beatIndex(at: time, in: beats, timeline: timeline),
+           beats.indices.contains(beatIdx),
+           let beatChord = beats[beatIdx].chord {
+            return beatChord.transposed(by: transpose)
+        }
+        if let segChord = timeline?.segment(at: time)?.chord {
+            return segChord.transposed(by: transpose)
+        }
+        return liveFallbackChord
+    }
+
     var body: some View {
         let cardBg = SoundChordTheme.cardBackground(for: colorScheme)
         let border = SoundChordTheme.hairline(for: colorScheme)
 
-        return Group {
-            if diagramsMode == .animated {
-                animatedCarouselContent
-            } else {
-                summaryGridContent
+        return PlaybackTimeline(anchor: anchor) { currentTime in
+            Group {
+                if diagramsMode == .animated {
+                    animatedCarouselContent(currentTime: currentTime)
+                } else {
+                    summaryGridContent(activeChord: resolvedActiveChord(at: currentTime))
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1643,19 +1867,22 @@ private struct ChordDiagramsView: View {
     }
 
     @ViewBuilder
-    private var animatedCarouselContent: some View {
+    private func animatedCarouselContent(currentTime: TimeInterval) -> some View {
         let secondary = SoundChordTheme.secondaryText(for: colorScheme)
 
         if changeSegments.isEmpty {
+            let activeChord = resolvedActiveChord(at: currentTime)
             VStack(spacing: 12) {
                 Spacer()
                 if let activeChord {
-                    diagramCard(
+                    ChordDiagramCardView(
                         chord: activeChord,
                         subtitle: activeChord.noteNamesList.joined(separator: " · "),
                         isActive: true,
                         progress: 0.5,
-                        large: true
+                        large: true,
+                        selectedInstrument: selectedInstrument,
+                        compact: compact
                     )
                 } else {
                     Text("Waiting for chord diagrams...")
@@ -1666,53 +1893,24 @@ private struct ChordDiagramsView: View {
             }
             .padding(16)
         } else {
-            let currentIdx = changeSegments.firstIndex(where: { currentTime >= $0.startTime && currentTime < $0.endTime })
-                ?? changeSegments.lastIndex(where: { $0.startTime <= currentTime })
-                ?? 0
+            let currentIdx = ChordPlaybackLookup.activeChangeSegmentIndex(in: changeSegments, at: currentTime)
             let upcomingSlice = Array(changeSegments.dropFirst(currentIdx).prefix(8))
 
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .center, spacing: 14) {
-                        ForEach(Array(upcomingSlice.enumerated()), id: \.element.id) { offset, seg in
-                            let displayed = seg.chord.transposed(by: transpose)
-                            let isCurrent = offset == 0 && currentTime >= seg.startTime && currentTime <= seg.endTime + 0.05
-                            let progress: Double = {
-                                guard isCurrent else { return 0 }
-                                let span = max(0.05, seg.duration)
-                                return min(1.0, max(0.0, (currentTime - seg.startTime) / span))
-                            }()
-
-                            Button {
-                                onSeek(seg.startTime)
-                            } label: {
-                                diagramCard(
-                                    chord: displayed,
-                                    subtitle: isCurrent ? "NOW · \(displayed.noteNamesList.joined(separator: " · "))" : Track.formatTime(seg.startTime),
-                                    isActive: isCurrent,
-                                    progress: progress,
-                                    large: offset == 0
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .id(seg.id)
-                        }
-                    }
-                    .padding(compact ? 12 : 20)
-                }
-                .onChange(of: currentIdx) { _, _ in
-                    if let firstId = upcomingSlice.first?.id {
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            proxy.scrollTo(firstId, anchor: .leading)
-                        }
-                    }
-                }
-            }
+            AnimatedDiagramCarouselScrollContent(
+                upcomingSlice: upcomingSlice,
+                currentIdx: currentIdx,
+                currentTime: currentTime,
+                transpose: transpose,
+                selectedInstrument: selectedInstrument,
+                compact: compact,
+                reduceMotion: reduceMotion,
+                onSeek: onSeek
+            )
         }
     }
 
     @ViewBuilder
-    private var summaryGridContent: some View {
+    private func summaryGridContent(activeChord: DetectedChord?) -> some View {
         let secondary = SoundChordTheme.secondaryText(for: colorScheme)
 
         if uniqueChords.isEmpty {
@@ -1736,12 +1934,14 @@ private struct ChordDiagramsView: View {
                                 onSeek(first.startTime)
                             }
                         } label: {
-                            diagramCard(
+                            ChordDiagramCardView(
                                 chord: chord,
                                 subtitle: chord.noteNamesList.joined(separator: " · "),
                                 isActive: isNow,
                                 progress: isNow ? 1.0 : 0.0,
-                                large: false
+                                large: false,
+                                selectedInstrument: selectedInstrument,
+                                compact: compact
                             )
                         }
                         .buttonStyle(.plain)
@@ -1751,14 +1951,77 @@ private struct ChordDiagramsView: View {
             }
         }
     }
+}
 
-    private func diagramCard(
-        chord: DetectedChord,
-        subtitle: String,
-        isActive: Bool,
-        progress: Double,
-        large: Bool
-    ) -> some View {
+private struct AnimatedDiagramCarouselScrollContent: View {
+    let upcomingSlice: [TimedChordSegment]
+    let currentIdx: Int
+    let currentTime: TimeInterval
+    let transpose: Int
+    let selectedInstrument: ChordsView.ChordInstrument
+    let compact: Bool
+    let reduceMotion: Bool
+    let onSeek: (TimeInterval) -> Void
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .center, spacing: 14) {
+                    ForEach(Array(upcomingSlice.enumerated()), id: \.element.id) { offset, seg in
+                        let displayed = seg.chord.transposed(by: transpose)
+                        let isCurrent = offset == 0 && currentTime >= seg.startTime && currentTime <= seg.endTime + 0.05
+                        let progress: Double = {
+                            guard isCurrent else { return 0 }
+                            let span = max(0.05, seg.duration)
+                            return min(1.0, max(0.0, (currentTime - seg.startTime) / span))
+                        }()
+
+                        Button {
+                            onSeek(seg.startTime)
+                        } label: {
+                            ChordDiagramCardView(
+                                chord: displayed,
+                                subtitle: isCurrent ? "NOW · \(displayed.noteNamesList.joined(separator: " · "))" : Track.formatTime(seg.startTime),
+                                isActive: isCurrent,
+                                progress: progress,
+                                large: offset == 0,
+                                selectedInstrument: selectedInstrument,
+                                compact: compact
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .id(seg.id)
+                    }
+                }
+                .padding(compact ? 12 : 20)
+            }
+            .onChange(of: currentIdx) { _, _ in
+                if let firstId = upcomingSlice.first?.id {
+                    if reduceMotion {
+                        proxy.scrollTo(firstId, anchor: .leading)
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo(firstId, anchor: .leading)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ChordDiagramCardView: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let chord: DetectedChord
+    let subtitle: String
+    let isActive: Bool
+    let progress: Double
+    let large: Bool
+    let selectedInstrument: ChordsView.ChordInstrument
+    let compact: Bool
+
+    var body: some View {
         let accent = SoundChordTheme.accentColor(for: colorScheme)
         let accentFg = SoundChordTheme.accentForeground(for: colorScheme)
         let primary = SoundChordTheme.primaryText(for: colorScheme)
@@ -1801,14 +2064,14 @@ private struct ChordDiagramsView: View {
                 .lineLimit(1)
 
             if large {
-                GeometryReader { geo in
-                    let w = max(0, geo.size.width * progress)
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(border)
-                        Capsule().fill(accent).frame(width: w)
-                    }
+                ZStack(alignment: .leading) {
+                    Rectangle().fill(border)
+                    Rectangle()
+                        .fill(accent)
+                        .scaleEffect(x: CGFloat(progress), y: 1.0, anchor: .leading)
                 }
                 .frame(height: 3)
+                .clipShape(Capsule())
             }
         }
         .padding(large ? 14 : 10)
@@ -1825,13 +2088,12 @@ private struct ChordDiagramsView: View {
 
 private struct ChordsGridView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let timeline: TrackChordTimeline?
     let beats: [BeatChordCell]
     let beatsPerBar: Int
-    let activeBeatIndex: Int?
-    let currentTime: TimeInterval
-    let isPlaying: Bool
+    let anchor: PlaybackAnchor
     let transpose: Int
     let loopRange: ClosedRange<TimeInterval>?
     let isLoopPickingMode: Bool
@@ -1841,25 +2103,49 @@ private struct ChordsGridView: View {
     let onTapBeat: (BeatChordCell) -> Void
     let onReanalyze: () -> Void
 
-    private struct BarGroup: Identifiable {
+    @State private var cachedBarRows: [BarRow] = []
+
+    fileprivate struct BarGroup: Identifiable {
         let id: Int
         let barIndex: Int
         let beats: [BeatChordCell]
         var startTime: TimeInterval { beats.first?.startTime ?? 0 }
     }
 
-    private struct BarRow: Identifiable {
+    fileprivate struct BarRow: Identifiable {
         let id: Int
         let bars: [BarGroup]
         let section: SongSection?
         var firstBarNumber: Int { (bars.first?.barIndex ?? 0) + 1 }
     }
 
+    private struct GridCacheKey: Equatable {
+        let beatCount: Int
+        let firstBeatId: UUID?
+        let lastBeatId: UUID?
+        let beatsPerBar: Int
+        let barsPerRow: Int
+        let timelineAnalyzedAt: Date?
+        let sectionCount: Int
+    }
+
     private var barsPerRow: Int {
         compact ? 2 : 4
     }
 
-    private var barRows: [BarRow] {
+    private var gridCacheKey: GridCacheKey {
+        GridCacheKey(
+            beatCount: beats.count,
+            firstBeatId: beats.first?.id,
+            lastBeatId: beats.last?.id,
+            beatsPerBar: beatsPerBar,
+            barsPerRow: barsPerRow,
+            timelineAnalyzedAt: timeline?.analyzedAt,
+            sectionCount: timeline?.sections.count ?? 0
+        )
+    }
+
+    private func buildBarRows() -> [BarRow] {
         guard !beats.isEmpty else { return [] }
         let groupedDict = Dictionary(grouping: beats, by: \.barIndex)
         let sortedKeys = groupedDict.keys.sorted()
@@ -1888,7 +2174,7 @@ private struct ChordsGridView: View {
         let accentFg = SoundChordTheme.accentForeground(for: colorScheme)
 
         return Group {
-            if barRows.isEmpty {
+            if cachedBarRows.isEmpty && beats.isEmpty {
                 VStack(spacing: 10) {
                     Spacer()
                     Text("No chord grid generated yet.")
@@ -1906,39 +2192,91 @@ private struct ChordsGridView: View {
                     Spacer()
                 }
             } else {
-                let activeBarIndex = activeBeatIndex.flatMap { beats.indices.contains($0) ? beats[$0].barIndex : nil }
-                let activeRowId = barRows.first(where: { row in
-                    row.bars.contains(where: { $0.barIndex == activeBarIndex })
-                })?.id
-
-                ScrollViewReader { proxy in
-                    ScrollView(.vertical, showsIndicators: true) {
-                        LazyVStack(alignment: .leading, spacing: 8) {
-                            ForEach(Array(barRows.enumerated()), id: \.element.id) { rowIdx, row in
-                                let prevSection = rowIdx > 0 ? barRows[rowIdx - 1].section : nil
-                                let isNewSection = row.section != nil && row.section?.id != prevSection?.id
-
-                                GridBarRowView(
-                                    row: row,
-                                    beatsPerBar: beatsPerBar,
-                                    barsPerRow: barsPerRow,
-                                    isNewSection: isNewSection,
-                                    activeBeatId: activeBeatIndex.flatMap { beats.indices.contains($0) ? beats[$0].id : nil },
-                                    currentTime: currentTime,
-                                    isPlaying: isPlaying,
-                                    transpose: transpose,
-                                    loopRange: loopRange,
-                                    loopPickAnchorId: loopPickAnchorBeat?.id,
-                                    compact: compact,
-                                    onTapBeat: onTapBeat
-                                )
-                                .id(row.id)
-                            }
-                        }
-                        .padding(compact ? 8 : 12)
+                PlaybackTimeline(anchor: anchor) { liveTime in
+                    let activeBeatIdx = ChordPlaybackLookup.beatIndex(at: liveTime, in: beats, timeline: timeline)
+                    let activeBeat = activeBeatIdx.flatMap { beats.indices.contains($0) ? beats[$0] : nil }
+                    let activeBarIndex = activeBeat?.barIndex
+                    let activeRowId = activeBarIndex.flatMap { barIdx in
+                        cachedBarRows.first(where: { row in
+                            row.bars.contains(where: { $0.barIndex == barIdx })
+                        })?.id
                     }
-                    .onChange(of: activeRowId) { _, newRowId in
-                        guard autoScroll, let newRowId else { return }
+
+                    ChordsGridScrollContent(
+                        barRows: cachedBarRows,
+                        beatsPerBar: beatsPerBar,
+                        barsPerRow: barsPerRow,
+                        activeBeatId: activeBeat?.id,
+                        activeRowId: activeRowId,
+                        currentTime: liveTime,
+                        isPlaying: anchor.isPlaying,
+                        transpose: transpose,
+                        loopRange: loopRange,
+                        loopPickAnchorId: loopPickAnchorBeat?.id,
+                        autoScroll: autoScroll,
+                        compact: compact,
+                        reduceMotion: reduceMotion,
+                        onTapBeat: onTapBeat
+                    )
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous).fill(cardBg))
+        .overlay(RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous).strokeBorder(border, lineWidth: 1))
+        .task(id: gridCacheKey) {
+            cachedBarRows = buildBarRows()
+        }
+    }
+
+    private struct ChordsGridScrollContent: View {
+        let barRows: [BarRow]
+        let beatsPerBar: Int
+        let barsPerRow: Int
+        let activeBeatId: UUID?
+        let activeRowId: Int?
+        let currentTime: TimeInterval
+        let isPlaying: Bool
+        let transpose: Int
+        let loopRange: ClosedRange<TimeInterval>?
+        let loopPickAnchorId: UUID?
+        let autoScroll: Bool
+        let compact: Bool
+        let reduceMotion: Bool
+        let onTapBeat: (BeatChordCell) -> Void
+
+        var body: some View {
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(barRows.enumerated()), id: \.element.id) { rowIdx, row in
+                            let prevSection = rowIdx > 0 ? barRows[rowIdx - 1].section : nil
+                            let isNewSection = row.section != nil && row.section?.id != prevSection?.id
+
+                            GridBarRowView(
+                                row: row,
+                                beatsPerBar: beatsPerBar,
+                                barsPerRow: barsPerRow,
+                                isNewSection: isNewSection,
+                                activeBeatId: activeBeatId,
+                                currentTime: currentTime,
+                                isPlaying: isPlaying,
+                                transpose: transpose,
+                                loopRange: loopRange,
+                                loopPickAnchorId: loopPickAnchorId,
+                                compact: compact,
+                                onTapBeat: onTapBeat
+                            )
+                            .id(row.id)
+                        }
+                    }
+                    .padding(compact ? 8 : 12)
+                }
+                .onChange(of: activeRowId) { _, newRowId in
+                    guard autoScroll, let newRowId else { return }
+                    if reduceMotion {
+                        proxy.scrollTo(newRowId, anchor: .center)
+                    } else {
                         withAnimation(.easeInOut(duration: 0.30)) {
                             proxy.scrollTo(newRowId, anchor: .center)
                         }
@@ -1946,9 +2284,6 @@ private struct ChordsGridView: View {
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous).fill(cardBg))
-        .overlay(RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous).strokeBorder(border, lineWidth: 1))
     }
 
     private struct GridBarRowView: View {
@@ -2127,13 +2462,12 @@ private struct GridBeatCellView: View {
                 .frame(height: compact ? 38 : 44)
 
                 if isCurrent {
-                    GeometryReader { geo in
-                        let w = max(2, geo.size.width * progress)
-                        let barColor = isDark ? Color.black.opacity(0.65) : Color.white.opacity(0.85)
-                        ZStack(alignment: .leading) {
-                            Rectangle().fill(barColor.opacity(0.25))
-                            Rectangle().fill(barColor).frame(width: w)
-                        }
+                    let barColor = isDark ? Color.black.opacity(0.65) : Color.white.opacity(0.85)
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(barColor.opacity(0.25))
+                        Rectangle()
+                            .fill(barColor)
+                            .scaleEffect(x: max(0.02, CGFloat(progress)), y: 1.0, anchor: .leading)
                     }
                     .frame(height: 2.5)
                 } else if isLooped {
@@ -2605,6 +2939,7 @@ private struct GuitarFretboardView: View {
                 }
             }
         }
+        .drawingGroup()
         .accessibilityLabel("Guitar chord fretboard diagram")
     }
 }
@@ -2617,6 +2952,7 @@ private struct PianoKeyboardView: View {
     let compact: Bool
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private let whitePitchClasses = [0, 2, 4, 5, 7, 9, 11]
 
@@ -2688,6 +3024,7 @@ private struct PianoKeyboardView: View {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .strokeBorder(border, lineWidth: 1)
         )
+        .drawingGroup()
         .accessibilityLabel("Two-octave piano chord keyboard")
     }
 
@@ -2729,7 +3066,7 @@ private struct PianoKeyboardView: View {
                     .padding(.bottom, 4)
             }
         }
-        .animation(.easeOut(duration: 0.16), value: isActive)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: isActive)
     }
 
     private func blackKeyView(pitchClass: Int, isActive: Bool, isRoot: Bool) -> some View {
@@ -2772,6 +3109,6 @@ private struct PianoKeyboardView: View {
                     .padding(.bottom, 3)
             }
         }
-        .animation(.easeOut(duration: 0.16), value: isActive)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: isActive)
     }
 }

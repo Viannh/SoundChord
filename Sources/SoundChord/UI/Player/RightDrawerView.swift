@@ -282,6 +282,7 @@ private struct QueueTrackRow: View {
 
     @State private var isHovered = false
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let primary = SoundChordTheme.primaryText(for: colorScheme)
@@ -358,8 +359,12 @@ private struct QueueTrackRow: View {
             onPlay()
         }
         .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.1)) {
+            if reduceMotion {
                 isHovered = hovering
+            } else {
+                withAnimation(.easeOut(duration: 0.10)) {
+                    isHovered = hovering
+                }
             }
         }
     }
@@ -399,10 +404,6 @@ private struct LyricsDrawerContent: View {
         appState.currentLyricsOffsetMs() / 1000.0
     }
 
-    private var effectiveTime: TimeInterval {
-        audio.currentTime + offsetSeconds
-    }
-
     var body: some View {
         let secondary = SoundChordTheme.secondaryText(for: colorScheme)
 
@@ -410,7 +411,15 @@ private struct LyricsDrawerContent: View {
             if let doc = appState.currentLyrics, !doc.lines.isEmpty {
                 lyricsToolbar(doc: doc)
                 Divider().overlay(SoundChordTheme.hairline(for: colorScheme))
-                syncedLyricsScroll(doc: doc)
+                DrawerSyncedLyricsView(
+                    doc: doc,
+                    anchor: audio.playbackAnchor,
+                    offsetSeconds: offsetSeconds,
+                    showTranslation: appState.showTranslatedLyrics,
+                    onSeek: { target in
+                        audio.seek(to: target)
+                    }
+                )
             } else if appState.isLoadingLyrics {
                 VStack(spacing: 12) {
                     Spacer()
@@ -518,45 +527,6 @@ private struct LyricsDrawerContent: View {
         .padding(.vertical, 10)
     }
 
-    private func syncedLyricsScroll(doc: LyricsDocument) -> some View {
-        let activeIdx = doc.isSynced ? LyricsSyncHelper.activeLineIndex(in: doc.lines, at: effectiveTime) : nil
-
-        return ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    ForEach(Array(doc.lines.enumerated()), id: \.element.id) { index, line in
-                        let isActive = activeIdx == index
-                        let isPast = activeIdx.map { index < $0 } ?? false
-
-                        DrawerLyricLineRow(
-                            line: line,
-                            isSynced: doc.isSynced,
-                            isActive: isActive,
-                            isPast: isPast,
-                            currentTime: effectiveTime,
-                            showTranslation: appState.showTranslatedLyrics
-                        ) {
-                            if doc.isSynced {
-                                audio.seek(to: max(0, line.startTime - offsetSeconds))
-                            }
-                        }
-                        .id(line.id)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 20)
-                .padding(.bottom, 96)
-            }
-            .onChange(of: activeIdx) { _, newIndex in
-                guard let newIndex, newIndex < doc.lines.count else { return }
-                let targetId = doc.lines[newIndex].id
-                withAnimation(.easeInOut(duration: 0.42)) {
-                    proxy.scrollTo(targetId, anchor: UnitPoint(x: 0.5, y: 0.22))
-                }
-            }
-        }
-    }
-
     private var emptyLyricsState: some View {
         let primary = SoundChordTheme.primaryText(for: colorScheme)
         let secondary = SoundChordTheme.secondaryText(for: colorScheme)
@@ -593,6 +563,84 @@ private struct LyricsDrawerContent: View {
     }
 }
 
+private struct DrawerSyncedLyricsView: View {
+    let doc: LyricsDocument
+    let anchor: PlaybackAnchor
+    let offsetSeconds: TimeInterval
+    let showTranslation: Bool
+    let onSeek: (TimeInterval) -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        PlaybackTimeline(anchor: anchor) { liveTime in
+            let effectiveTime = liveTime + offsetSeconds
+            let activeIdx = doc.isSynced ? LyricsSyncHelper.activeLineIndex(in: doc.lines, at: effectiveTime) : nil
+
+            DrawerSyncedLyricsScrollContent(
+                doc: doc,
+                activeIdx: activeIdx,
+                effectiveTime: effectiveTime,
+                offsetSeconds: offsetSeconds,
+                showTranslation: showTranslation,
+                reduceMotion: reduceMotion,
+                onSeek: onSeek
+            )
+        }
+    }
+}
+
+private struct DrawerSyncedLyricsScrollContent: View {
+    let doc: LyricsDocument
+    let activeIdx: Int?
+    let effectiveTime: TimeInterval
+    let offsetSeconds: TimeInterval
+    let showTranslation: Bool
+    let reduceMotion: Bool
+    let onSeek: (TimeInterval) -> Void
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(Array(doc.lines.enumerated()), id: \.element.id) { index, line in
+                        let isActive = activeIdx == index
+                        let isPast = activeIdx.map { index < $0 } ?? false
+
+                        DrawerLyricLineRow(
+                            line: line,
+                            isSynced: doc.isSynced,
+                            isActive: isActive,
+                            isPast: isPast,
+                            currentTime: effectiveTime,
+                            showTranslation: showTranslation
+                        ) {
+                            if doc.isSynced {
+                                onSeek(max(0, line.startTime - offsetSeconds))
+                            }
+                        }
+                        .id(line.id)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 20)
+                .padding(.bottom, 96)
+            }
+            .onChange(of: activeIdx) { _, newIndex in
+                guard let newIndex, newIndex < doc.lines.count else { return }
+                let targetId = doc.lines[newIndex].id
+                if reduceMotion {
+                    proxy.scrollTo(targetId, anchor: UnitPoint(x: 0.5, y: 0.22))
+                } else {
+                    withAnimation(.easeInOut(duration: 0.40)) {
+                        proxy.scrollTo(targetId, anchor: UnitPoint(x: 0.5, y: 0.22))
+                    }
+                }
+            }
+        }
+    }
+}
+
 private struct DrawerLyricLineRow: View {
     let line: LyricLine
     let isSynced: Bool
@@ -604,6 +652,7 @@ private struct DrawerLyricLineRow: View {
 
     @State private var isHovered = false
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let primary = SoundChordTheme.primaryText(for: colorScheme)
@@ -631,8 +680,8 @@ private struct DrawerLyricLineRow: View {
             RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous)
                 .fill(isHovered && isSynced ? hoverBg : .clear)
         )
-        .scaleEffect(isActive ? 1.02 : 1.0, anchor: .leading)
-        .animation(.easeOut(duration: 0.2), value: isActive)
+        .scaleEffect(isActive && !reduceMotion ? 1.02 : 1.0, anchor: .leading)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: isActive)
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
         .onHover { hovering in
@@ -678,12 +727,20 @@ private struct DrawerLyricLineRow: View {
 enum LyricsSyncHelper {
     static func activeLineIndex(in lines: [LyricLine], at time: TimeInterval) -> Int? {
         guard !lines.isEmpty else { return nil }
-        var matched: Int?
-        for (idx, line) in lines.enumerated() {
-            if line.startTime <= time + 0.08 {
-                matched = idx
+        let threshold = time + 0.08
+        if lines[0].startTime > threshold {
+            return nil
+        }
+        var low = 0
+        var high = lines.count - 1
+        var matched = 0
+        while low <= high {
+            let mid = low + (high - low) / 2
+            if lines[mid].startTime <= threshold {
+                matched = mid
+                low = mid + 1
             } else {
-                break
+                high = mid - 1
             }
         }
         return matched

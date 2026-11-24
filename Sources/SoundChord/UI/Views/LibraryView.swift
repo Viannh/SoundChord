@@ -52,7 +52,7 @@ public struct LibraryView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
+            LazyVStack(alignment: .leading, spacing: 22) {
                 // Header
                 HStack(alignment: .bottom) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -344,10 +344,15 @@ public struct LibraryView: View {
         .frame(width: 380)
     }
 
-    private func relativeTime(_ date: Date) -> String {
+    @MainActor
+    private static let relativeDateFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
+        return formatter
+    }()
+
+    private func relativeTime(_ date: Date) -> String {
+        Self.relativeDateFormatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
@@ -356,6 +361,8 @@ public struct LibraryView: View {
 public struct DownloadsView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
+
+    @State private var cachedStorageBytes: Int64 = 0
 
     public init() {}
 
@@ -369,25 +376,17 @@ public struct DownloadsView: View {
         appState.libraryStore.downloads
     }
 
-    private var totalStorageBytes: Int64 {
-        let fm = FileManager.default
-        return completedTracks.reduce(Int64(0)) { total, track in
-            guard let url = track.localFileURL ?? appState.libraryStore.localFileURL(for: track.id),
-                  let attrs = try? fm.attributesOfItem(atPath: url.path),
-                  let size = attrs[.size] as? Int64 else {
-                return total
-            }
-            return total + size
-        }
+    private var completedTrackIdsKey: [String] {
+        completedTracks.map(\.id)
     }
 
     private var formattedStorage: String {
-        ByteCountFormatter.string(fromByteCount: totalStorageBytes, countStyle: .file)
+        ByteCountFormatter.string(fromByteCount: cachedStorageBytes, countStyle: .file)
     }
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 24) {
                 // Header
                 HStack(alignment: .bottom) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -460,7 +459,7 @@ public struct DownloadsView: View {
                             .font(.system(size: 18, weight: .bold))
                             .padding(.horizontal, 36)
 
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(activeTasks) { task in
                                 HStack(spacing: 12) {
                                     ArtworkImage(url: task.track.artworkURL, size: 42, cornerRadius: SoundChordTheme.cornerRadiusArtworkSmall)
@@ -549,6 +548,23 @@ public struct DownloadsView: View {
             }
             .padding(.bottom, 110)
         }
+        .task(id: completedTrackIdsKey) {
+            let urls: [URL] = completedTracks.compactMap { track in
+                track.localFileURL ?? appState.libraryStore.localFileURL(for: track.id)
+            }
+            let total = await Task.detached(priority: .utility) { () -> Int64 in
+                let fm = FileManager.default
+                var sum: Int64 = 0
+                for url in urls {
+                    if let attrs = try? fm.attributesOfItem(atPath: url.path),
+                       let size = attrs[.size] as? Int64 {
+                        sum += size
+                    }
+                }
+                return sum
+            }.value
+            cachedStorageBytes = total
+        }
     }
 }
 
@@ -572,7 +588,7 @@ public struct LocalMusicView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 24) {
                 // Header
                 HStack(alignment: .bottom) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -635,7 +651,7 @@ public struct LocalMusicView: View {
                             .font(.system(size: 13))
                             .foregroundStyle(SoundChordTheme.secondaryText(for: colorScheme))
                     } else {
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(folders, id: \.self) { path in
                                 HStack(spacing: 10) {
                                     Image(systemName: "folder.fill")
@@ -779,15 +795,32 @@ public struct ReplayView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
 
+    @State private var cachedSummary: ReplaySummary?
+
     public init() {}
 
+    private struct HistoryCacheKey: Equatable {
+        let count: Int
+        let firstEventId: UUID?
+        let lastEventId: UUID?
+    }
+
+    private var historyCacheKey: HistoryCacheKey {
+        let history = appState.libraryStore.history
+        return HistoryCacheKey(
+            count: history.count,
+            firstEventId: history.first?.id,
+            lastEventId: history.last?.id
+        )
+    }
+
     public var body: some View {
-        let summary = appState.libraryStore.computeReplaySummary()
+        let summary = cachedSummary ?? ReplaySummary()
         let accent = SoundChordTheme.accentColor(for: colorScheme)
         let accentFg = SoundChordTheme.accentForeground(for: colorScheme)
 
         return ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
+            LazyVStack(alignment: .leading, spacing: 28) {
                 // Header
                 VStack(alignment: .leading, spacing: 4) {
                     Text("LISTENING INSIGHTS")
@@ -963,6 +996,9 @@ public struct ReplayView: View {
             }
             .padding(.bottom, 110)
         }
+        .task(id: historyCacheKey) {
+            cachedSummary = appState.libraryStore.computeReplaySummary()
+        }
     }
 
     private func monthlyChartCard(_ monthly: [String: Int]) -> some View {
@@ -1021,10 +1057,15 @@ public struct ReplayView: View {
         return "\(display):00 \(suffix)"
     }
 
-    private func shortTimestamp(_ date: Date) -> String {
+    @MainActor
+    private static let relativeDateFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
+        return formatter
+    }()
+
+    private func shortTimestamp(_ date: Date) -> String {
+        Self.relativeDateFormatter.localizedString(for: date, relativeTo: Date())
     }
 }
 

@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import ImageIO
 import SwiftUI
 
 @MainActor
@@ -106,7 +107,9 @@ public final class AppState: ObservableObject {
     }
 
     private func bindServices() {
-        // Forward nested ObservableObject updates so views observing AppState stay in sync.
+        // Forward discrete ObservableObject updates so views observing AppState stay in sync.
+        // High-frequency playback clock values live on audioEngine.clock so steady playback
+        // emits zero AppState.objectWillChange ticks per second.
         audioEngine.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
@@ -392,7 +395,10 @@ public final class AppState: ObservableObject {
                     duration: max(track.duration, self.audioEngine.duration),
                     settings: settings
                 )
-                self.isDiscordConnected = await self.discordRPC.isConnected
+                let connected = await self.discordRPC.isConnected
+                if self.isDiscordConnected != connected {
+                    self.isDiscordConnected = connected
+                }
             }
         }
     }
@@ -415,7 +421,10 @@ public final class AppState: ObservableObject {
                 duration: max(track.duration, duration),
                 settings: settings
             )
-            self.isDiscordConnected = await self.discordRPC.isConnected
+            let connected = await self.discordRPC.isConnected
+            if self.isDiscordConnected != connected {
+                self.isDiscordConnected = connected
+            }
         }
     }
 
@@ -596,8 +605,13 @@ public final class AppState: ObservableObject {
                                       self.isAnalyzingChords,
                                       self.activeChordAnalysisRunId == runId,
                                       self.audioEngine.currentTrack?.id == targetTrackId else { return }
-                                self.chordAnalysisStatus = "Analyzing full beat grid..."
-                                self.chordAnalysisProgress = min(0.99, max(0.15, 0.15 + 0.84 * progress))
+                                if self.chordAnalysisStatus != "Analyzing full beat grid..." {
+                                    self.chordAnalysisStatus = "Analyzing full beat grid..."
+                                }
+                                let nextProgress = min(0.99, max(0.15, 0.15 + 0.84 * progress))
+                                if abs(nextProgress - self.chordAnalysisProgress) >= 0.02 || nextProgress >= 0.99 {
+                                    self.chordAnalysisProgress = nextProgress
+                                }
                             }
                         }
                     )
@@ -672,8 +686,13 @@ public final class AppState: ObservableObject {
                                       self.isAnalyzingChords,
                                       self.activeChordAnalysisRunId == runId,
                                       self.audioEngine.currentTrack?.id == targetTrackId else { return }
-                                self.chordAnalysisStatus = "Analyzing full beat grid..."
-                                self.chordAnalysisProgress = min(0.99, max(0.15, 0.15 + 0.84 * progress))
+                                if self.chordAnalysisStatus != "Analyzing full beat grid..." {
+                                    self.chordAnalysisStatus = "Analyzing full beat grid..."
+                                }
+                                let nextProgress = min(0.99, max(0.15, 0.15 + 0.84 * progress))
+                                if abs(nextProgress - self.chordAnalysisProgress) >= 0.02 || nextProgress >= 0.99 {
+                                    self.chordAnalysisProgress = nextProgress
+                                }
                             }
                         }
                     )
@@ -708,10 +727,14 @@ public final class AppState: ObservableObject {
                                   self.isAnalyzingChords,
                                   self.activeChordAnalysisRunId == runId,
                                   self.audioEngine.currentTrack?.id == targetTrackId else { return }
-                            if self.currentChordTimeline?.isPartial != true {
+                            if self.currentChordTimeline?.isPartial != true,
+                               self.chordAnalysisStatus != "Downloading audio..." {
                                 self.chordAnalysisStatus = "Downloading audio..."
                             }
-                            self.chordAnalysisProgress = min(0.55, max(0.05, dlProgress * 0.55))
+                            let nextProgress = min(0.55, max(0.05, dlProgress * 0.55))
+                            if abs(nextProgress - self.chordAnalysisProgress) >= 0.02 || nextProgress >= 0.54 {
+                                self.chordAnalysisProgress = nextProgress
+                            }
                         }
                     }
                 )
@@ -775,8 +798,13 @@ public final class AppState: ObservableObject {
                                               self.isAnalyzingChords,
                                               self.activeChordAnalysisRunId == runId,
                                               self.audioEngine.currentTrack?.id == targetTrackId else { return }
-                                        self.chordAnalysisStatus = "Analyzing full beat grid..."
-                                        self.chordAnalysisProgress = min(0.99, max(0.55, 0.55 + 0.44 * progress))
+                                        if self.chordAnalysisStatus != "Analyzing full beat grid..." {
+                                            self.chordAnalysisStatus = "Analyzing full beat grid..."
+                                        }
+                                        let nextProgress = min(0.99, max(0.55, 0.55 + 0.44 * progress))
+                                        if abs(nextProgress - self.chordAnalysisProgress) >= 0.02 || nextProgress >= 0.99 {
+                                            self.chordAnalysisProgress = nextProgress
+                                        }
                                     }
                                 }
                             )
@@ -992,17 +1020,30 @@ public final class AppState: ObservableObject {
         do {
             let data: Data
             if url.isFileURL {
-                data = try Data(contentsOf: url)
+                data = try await Task.detached(priority: .utility) {
+                    try Data(contentsOf: url)
+                }.value
             } else {
                 let (fetched, _) = try await URLSession.shared.data(from: url)
                 data = fetched
             }
-            guard let image = NSImage(data: data),
-                  let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-                return nil
-            }
             return await Task.detached(priority: .utility) {
-                extractQuadrantColors(from: cgImage)
+                let sourceOptions: [CFString: Any] = [
+                    kCGImageSourceShouldCache: false
+                ]
+                guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary) else {
+                    return nil
+                }
+                let thumbOptions: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 64,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true
+                ]
+                guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
+                    return nil
+                }
+                return extractQuadrantColors(from: cgImage)
             }.value
         } catch {
             return nil

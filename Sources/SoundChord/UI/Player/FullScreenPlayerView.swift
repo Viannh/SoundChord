@@ -3,14 +3,11 @@ import SwiftUI
 public struct FullScreenPlayerView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var appColorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var showAudioControlsPopover = false
     @State private var showStatsPopover = false
     @State private var rightPaneMode: FullScreenRightPane = .lyrics
-    @State private var isScrubbing = false
-    @State private var scrubTime: TimeInterval = 0
-    @State private var isHoveringScrubber = false
-    @State private var isHoveringLyricsArea = false
 
     public init() {}
 
@@ -27,21 +24,8 @@ public struct FullScreenPlayerView: View {
         max(audio.duration, track?.duration ?? 0)
     }
 
-    private var displayedTime: TimeInterval {
-        isScrubbing ? scrubTime : audio.currentTime
-    }
-
-    private var progress: Double {
-        guard effectiveDuration > 0 else { return 0 }
-        return min(1, max(0, displayedTime / effectiveDuration))
-    }
-
     private var offsetSeconds: TimeInterval {
         appState.currentLyricsOffsetMs() / 1000.0
-    }
-
-    private var effectiveLyricTime: TimeInterval {
-        audio.currentTime + offsetSeconds
     }
 
     public var body: some View {
@@ -238,8 +222,8 @@ public struct FullScreenPlayerView: View {
                 )
                 .shadow(color: Color.black.opacity(0.45), radius: 26, x: 0, y: 14)
             }
-            .scaleEffect(audio.isPlaying ? 1.0 : 0.94)
-            .animation(.spring(response: 0.48, dampingFraction: 0.78), value: audio.isPlaying)
+            .scaleEffect(audio.isPlaying ? 1.0 : (reduceMotion ? 1.0 : 0.94))
+            .animation(reduceMotion ? nil : .spring(response: 0.48, dampingFraction: 0.78), value: audio.isPlaying)
 
             if let track {
                 HStack(alignment: .center, spacing: 12) {
@@ -285,21 +269,15 @@ public struct FullScreenPlayerView: View {
                 }
             }
 
-            VStack(spacing: 6) {
-                fullScrubberTrack
-
-                HStack {
-                    Text(Track.formatTime(displayedTime))
-                        .font(.system(size: 11.5, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.white.opacity(0.72))
-
-                    Spacer()
-
-                    Text("-\(Track.formatTime(max(0, effectiveDuration - displayedTime)))")
-                        .font(.system(size: 11.5, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.white.opacity(0.72))
+            HighRefreshScrubberView(
+                anchor: audio.playbackAnchor,
+                hasTrack: track != nil,
+                fallbackDuration: track?.duration ?? 0,
+                style: .fullScreen,
+                onSeek: { target in
+                    audio.seek(to: target)
                 }
-            }
+            )
 
             HStack(spacing: 24) {
                 Button {
@@ -434,59 +412,6 @@ public struct FullScreenPlayerView: View {
         .help(isDownloaded ? "Downloaded for Offline (click to remove)" : "Download for Offline")
     }
 
-    private var fullScrubberTrack: some View {
-        GeometryReader { geo in
-            let width = max(1, geo.size.width)
-            let barHeight: CGFloat = (isHoveringScrubber || isScrubbing) ? 7 : 5
-
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color.white.opacity(0.22))
-                    .frame(height: barHeight)
-
-                Capsule()
-                    .fill(Color.white.opacity(0.95))
-                    .frame(width: max(0, width * progress), height: barHeight)
-
-                if isHoveringScrubber || isScrubbing {
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: 13, height: 13)
-                        .shadow(color: Color.black.opacity(0.45), radius: 4, y: 1)
-                        .offset(x: max(0, min(width - 13, width * progress - 6.5)))
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        guard effectiveDuration > 0 else { return }
-                        isScrubbing = true
-                        let frac = min(1, max(0, value.location.x / width))
-                        scrubTime = frac * effectiveDuration
-                    }
-                    .onEnded { value in
-                        guard effectiveDuration > 0 else {
-                            isScrubbing = false
-                            return
-                        }
-                        let frac = min(1, max(0, value.location.x / width))
-                        let target = frac * effectiveDuration
-                        scrubTime = target
-                        audio.seek(to: target)
-                        isScrubbing = false
-                    }
-            )
-        }
-        .frame(height: 16)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.14)) {
-                isHoveringScrubber = hovering
-            }
-        }
-    }
-
     // MARK: - Right Column: Synced Lyrics, Chords or Queue
 
     @ViewBuilder
@@ -506,63 +431,16 @@ public struct FullScreenPlayerView: View {
 
         return VStack(spacing: 12) {
             if let doc = appState.currentLyrics, !doc.lines.isEmpty {
-                let activeIdx = doc.isSynced ? LyricsSyncHelper.activeLineIndex(in: doc.lines, at: effectiveLyricTime) : nil
-
-                ScrollViewReader { proxy in
-                    ScrollView(.vertical, showsIndicators: false) {
-                        LazyVStack(alignment: .leading, spacing: 24) {
-                            Spacer().frame(height: 52)
-
-                            ForEach(Array(doc.lines.enumerated()), id: \.element.id) { index, line in
-                                let isActive = activeIdx == index
-                                let distance = activeIdx.map { abs(index - $0) } ?? 0
-
-                                FullScreenLyricLineView(
-                                    line: line,
-                                    baseFontSize: baseFontSize,
-                                    isSynced: doc.isSynced,
-                                    isActive: isActive,
-                                    distanceFromActive: distance,
-                                    disableBlur: isHoveringLyricsArea,
-                                    currentTime: effectiveLyricTime,
-                                    showTranslation: appState.showTranslatedLyrics
-                                ) {
-                                    if doc.isSynced {
-                                        audio.seek(to: max(0, line.startTime - offsetSeconds))
-                                    }
-                                }
-                                .id(line.id)
-                            }
-
-                            Spacer().frame(height: 140)
-                        }
-                        .padding(.horizontal, 12)
+                FullScreenSyncedLyricsView(
+                    doc: doc,
+                    anchor: audio.playbackAnchor,
+                    offsetSeconds: offsetSeconds,
+                    baseFontSize: baseFontSize,
+                    showTranslation: appState.showTranslatedLyrics,
+                    onSeek: { target in
+                        audio.seek(to: target)
                     }
-                    .mask(
-                        LinearGradient(
-                            stops: [
-                                .init(color: .clear, location: 0.0),
-                                .init(color: .black, location: 0.10),
-                                .init(color: .black, location: 0.84),
-                                .init(color: .clear, location: 1.0)
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .onHover { hovering in
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            isHoveringLyricsArea = hovering
-                        }
-                    }
-                    .onChange(of: activeIdx) { _, newIdx in
-                        guard let newIdx, newIdx < doc.lines.count else { return }
-                        let targetId = doc.lines[newIdx].id
-                        withAnimation(.easeInOut(duration: 0.48)) {
-                            proxy.scrollTo(targetId, anchor: UnitPoint(x: 0.5, y: 0.30))
-                        }
-                    }
-                }
+                )
 
                 lyricsFooterControls(doc: doc)
             } else if appState.isLoadingLyrics {
@@ -825,7 +703,7 @@ public struct FullScreenPlayerView: View {
                     sleepTimerButton("45m", minutes: 45)
                     sleepTimerButton("60m", minutes: 60)
                     Button("End of Track") {
-                        let remaining = max(1, effectiveDuration - audio.currentTime)
+                        let remaining = max(1, effectiveDuration - audio.playbackAnchor.interpolatedTime())
                         let mins = max(1, Int(ceil(remaining / 60.0)))
                         audio.setSleepTimer(minutes: mins)
                         appState.showToast("Sleep timer set for end of track")
@@ -876,6 +754,117 @@ public struct FullScreenPlayerView: View {
     }
 }
 
+// MARK: - Isolated High-Refresh Full-Screen Synced Lyrics
+
+private struct FullScreenSyncedLyricsView: View {
+    let doc: LyricsDocument
+    let anchor: PlaybackAnchor
+    let offsetSeconds: TimeInterval
+    let baseFontSize: CGFloat
+    let showTranslation: Bool
+    let onSeek: (TimeInterval) -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHoveringLyricsArea = false
+
+    var body: some View {
+        PlaybackTimeline(anchor: anchor) { liveTime in
+            let effectiveTime = liveTime + offsetSeconds
+            let activeIdx = doc.isSynced ? LyricsSyncHelper.activeLineIndex(in: doc.lines, at: effectiveTime) : nil
+
+            FullScreenSyncedLyricsScrollContent(
+                doc: doc,
+                activeIdx: activeIdx,
+                effectiveTime: effectiveTime,
+                offsetSeconds: offsetSeconds,
+                baseFontSize: baseFontSize,
+                showTranslation: showTranslation,
+                isHoveringLyricsArea: isHoveringLyricsArea,
+                reduceMotion: reduceMotion,
+                onSeek: onSeek
+            )
+        }
+        .onHover { hovering in
+            if reduceMotion {
+                isHoveringLyricsArea = hovering
+            } else {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    isHoveringLyricsArea = hovering
+                }
+            }
+        }
+    }
+}
+
+private struct FullScreenSyncedLyricsScrollContent: View {
+    let doc: LyricsDocument
+    let activeIdx: Int?
+    let effectiveTime: TimeInterval
+    let offsetSeconds: TimeInterval
+    let baseFontSize: CGFloat
+    let showTranslation: Bool
+    let isHoveringLyricsArea: Bool
+    let reduceMotion: Bool
+    let onSeek: (TimeInterval) -> Void
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                LazyVStack(alignment: .leading, spacing: 24) {
+                    Spacer().frame(height: 52)
+
+                    ForEach(Array(doc.lines.enumerated()), id: \.element.id) { index, line in
+                        let isActive = activeIdx == index
+                        let distance = activeIdx.map { abs(index - $0) } ?? 0
+
+                        FullScreenLyricLineView(
+                            line: line,
+                            baseFontSize: baseFontSize,
+                            isSynced: doc.isSynced,
+                            isActive: isActive,
+                            distanceFromActive: distance,
+                            disableBlur: isHoveringLyricsArea || reduceMotion,
+                            currentTime: effectiveTime,
+                            showTranslation: showTranslation
+                        ) {
+                            if doc.isSynced {
+                                onSeek(max(0, line.startTime - offsetSeconds))
+                            }
+                        }
+                        .id(line.id)
+                    }
+
+                    Spacer().frame(height: 140)
+                }
+                .padding(.horizontal, 12)
+            }
+            .mask(
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.0),
+                        .init(color: .black, location: 0.10),
+                        .init(color: .black, location: 0.84),
+                        .init(color: .clear, location: 1.0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+            .onChange(of: activeIdx) { _, newIdx in
+                guard let newIdx, newIdx < doc.lines.count else { return }
+                let targetId = doc.lines[newIdx].id
+                if reduceMotion {
+                    proxy.scrollTo(targetId, anchor: UnitPoint(x: 0.5, y: 0.30))
+                } else {
+                    withAnimation(.easeInOut(duration: 0.45)) {
+                        proxy.scrollTo(targetId, anchor: UnitPoint(x: 0.5, y: 0.30))
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Apple Music Style Full-Screen Lyric Line
 
 private struct FullScreenLyricLineView: View {
@@ -889,6 +878,7 @@ private struct FullScreenLyricLineView: View {
     let showTranslation: Bool
     let onTap: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovered = false
 
     private var lineFontSize: CGFloat {
@@ -926,10 +916,10 @@ private struct FullScreenLyricLineView: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(isHovered && isSynced ? Color.white.opacity(0.08) : .clear)
         )
-        .scaleEffect(isActive ? 1.03 : 1.0, anchor: .leading)
+        .scaleEffect(isActive && !reduceMotion ? 1.03 : 1.0, anchor: .leading)
         .blur(radius: blurRadius)
-        .animation(.spring(response: 0.38, dampingFraction: 0.82), value: isActive)
-        .animation(.easeOut(duration: 0.2), value: blurRadius)
+        .animation(reduceMotion ? nil : .spring(response: 0.38, dampingFraction: 0.82), value: isActive)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: blurRadius)
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
         .onHover { hovering in

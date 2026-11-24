@@ -7,11 +7,67 @@ import Foundation
 import ImageIO
 import MediaPlayer
 import os
+import QuartzCore
+
+// MARK: - High-Refresh Playback Anchor & Isolated High-Frequency Clock
+
+public struct PlaybackAnchor: Equatable, Sendable {
+    public let mediaTime: TimeInterval
+    public let hostTime: TimeInterval
+    public let rate: Double
+    public let isPlaying: Bool
+    public let duration: TimeInterval
+
+    public init(
+        mediaTime: TimeInterval = 0,
+        hostTime: TimeInterval = CACurrentMediaTime(),
+        rate: Double = 1.0,
+        isPlaying: Bool = false,
+        duration: TimeInterval = 0
+    ) {
+        self.mediaTime = mediaTime
+        self.hostTime = hostTime
+        self.rate = rate
+        self.isPlaying = isPlaying
+        self.duration = duration
+    }
+
+    public func interpolatedTime(atHostTime now: TimeInterval = CACurrentMediaTime()) -> TimeInterval {
+        guard isPlaying, rate > 0 else {
+            return mediaTime
+        }
+        let projected = mediaTime + max(0, now - hostTime) * rate
+        if duration > 0 {
+            return min(duration, projected)
+        }
+        return projected
+    }
+}
+
+@MainActor
+public final class PlaybackClock: ObservableObject {
+    @Published public var currentTime: TimeInterval = 0
+    @Published public var chromaVector: [Float] = Array(repeating: 0, count: 12)
+
+    public init() {}
+}
 
 // MARK: - AudioEngine (Dual-Deck AVPlayer + Real-Time 7-Band EQ DSP + MediaPlayer)
 
 @MainActor
 public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
+    // MARK: - Isolated High-Frequency Clock
+
+    public let clock = PlaybackClock()
+
+    public var currentTime: TimeInterval {
+        clock.currentTime
+    }
+
+    public var chromaVector: [Float] {
+        clock.chromaVector
+    }
+
     // MARK: - Published State
 
     @Published public private(set) var isPlaying: Bool = false
@@ -19,8 +75,8 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
     @Published public private(set) var currentTrack: Track?
     @Published public private(set) var queue: [Track] = []
     @Published public private(set) var currentIndex: Int = 0
-    @Published public private(set) var currentTime: TimeInterval = 0
     @Published public private(set) var duration: TimeInterval = 0
+    @Published public private(set) var playbackAnchor = PlaybackAnchor()
     @Published public private(set) var volume: Float = 0.85
     @Published public private(set) var isMuted: Bool = false
     @Published public private(set) var isShuffled: Bool = false
@@ -40,7 +96,6 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
     @Published public private(set) var currentChord: DetectedChord? = nil
     @Published public private(set) var chordHistory: [ChordHistoryEntry] = []
     @Published public private(set) var detectedKey: String? = nil
-    @Published public private(set) var chromaVector: [Float] = Array(repeating: 0, count: 12)
     @Published public var chordSimpleMode: Bool = true
     @Published public var chordTransposeSemitones: Int = 0
 
@@ -241,9 +296,12 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         cancelCountIn()
         cancelCrossfade()
         flushPlaySeconds()
+        let exactTime = resolvedPlayerTime(fallback: playbackAnchor.interpolatedTime())
         activePlayer.pause()
+        clock.currentTime = exactTime
         isPlaying = false
         isBuffering = false
+        updatePlaybackAnchor(mediaTime: exactTime)
         updateChordPollingTimer()
         updateNowPlayingInfo()
         onPlaybackStateChanged?(false, currentTime, duration)
@@ -266,8 +324,10 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         // If at end of item, restart from beginning
         if duration > 0 && currentTime >= max(0, duration - 0.3) {
             activePlayer.seek(to: .zero)
-            currentTime = 0
+            clock.currentTime = 0
             resetChordAnalysis()
+        } else {
+            clock.currentTime = resolvedPlayerTime(fallback: clock.currentTime)
         }
 
         sleepFadeMultiplier = 1.0
@@ -275,6 +335,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         activePlayer.playImmediately(atRate: playbackRate)
         isPlaying = true
         lastTickTimestamp = Date()
+        updatePlaybackAnchor(mediaTime: clock.currentTime)
         updateChordPollingTimer()
         updateNowPlayingInfo()
         onPlaybackStateChanged?(true, currentTime, duration)
@@ -390,12 +451,16 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         isLoopSeeking = false
         let clamped = max(0, duration > 0 ? min(time, duration) : time)
         let target = CMTime(seconds: clamped, preferredTimescale: 600)
-        currentTime = clamped
+        clock.currentTime = clamped
+        updatePlaybackAnchor(mediaTime: clamped)
         resetChordAnalysis()
         updateNowPlayingInfo()
         activePlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                let settled = self.resolvedPlayerTime(fallback: clamped)
+                self.clock.currentTime = settled
+                self.updatePlaybackAnchor(mediaTime: settled)
                 self.updateNowPlayingInfo()
                 self.onPlaybackStateChanged?(self.isPlaying, self.currentTime, self.duration)
             }
@@ -468,10 +533,14 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
 
     public func setPlaybackRate(_ rate: Float) {
         let clamped = max(0.5, min(2.0, rate))
+        if isPlaying {
+            clock.currentTime = resolvedPlayerTime(fallback: playbackAnchor.interpolatedTime())
+        }
         playbackRate = clamped
         if isPlaying {
             activePlayer.rate = clamped
         }
+        updatePlaybackAnchor(mediaTime: clock.currentTime)
         updateNowPlayingInfo()
     }
 
@@ -650,7 +719,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         currentTrack = nil
         currentStreamInfo = nil
         currentIndex = 0
-        currentTime = 0
+        clock.currentTime = 0
         duration = 0
         isPlaying = false
         isBuffering = false
@@ -658,6 +727,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         activeAuthoritativeDuration = nil
         retriedTrackIds.removeAll()
         hasTriggeredSafetyEndAdvance = false
+        updatePlaybackAnchor(mediaTime: 0)
         chordDetector.setActiveSource(0)
         resetChordAnalysis()
         updateChordPollingTimer()
@@ -679,7 +749,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         loopRange = nil
         isLoopSeeking = false
         currentTrack = track
-        currentTime = 0
+        clock.currentTime = 0
         duration = track.duration
         isBuffering = true
         lastError = nil
@@ -689,6 +759,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         activeAuthoritativeDuration = nil
         hasTriggeredSafetyEndAdvance = false
         retriedTrackIds.remove(track.id)
+        updatePlaybackAnchor(mediaTime: 0)
         resetChordAnalysis()
 
         // Fast path: use preloaded item if it matches
@@ -725,6 +796,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
                 self.isBuffering = false
                 self.isPlaying = false
                 self.lastError = "Unable to play \"\(track.title)\": \(error.localizedDescription)"
+                self.updatePlaybackAnchor(mediaTime: 0)
                 self.updateChordPollingTimer()
                 self.updateNowPlayingInfo()
                 self.onPlaybackStateChanged?(false, 0, track.duration)
@@ -764,7 +836,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         activeAuthoritativeDuration = authoritativeDur
         hasTriggeredSafetyEndAdvance = false
         duration = authoritativeDur ?? track.duration
-        currentTime = 0
+        clock.currentTime = 0
         isBuffering = !isLocalAsset && item.status != .readyToPlay
         isPlaying = true
         lastError = nil
@@ -776,6 +848,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         player.volume = currentEffectiveVolume()
         player.playImmediately(atRate: playbackRate)
 
+        updatePlaybackAnchor(mediaTime: 0)
         updateChordPollingTimer()
         onTrackChanged?(track, stream)
         onPlaybackStateChanged?(true, 0, duration)
@@ -880,13 +953,17 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
             isLoopSeeking = true
             let targetTime = loop.lowerBound
             let target = CMTime(seconds: targetTime, preferredTimescale: 600)
-            currentTime = targetTime
+            clock.currentTime = targetTime
+            updatePlaybackAnchor(mediaTime: targetTime)
             resetChordAnalysis()
             await activePlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
             isLoopSeeking = false
             activePlayer.playImmediately(atRate: playbackRate)
             isPlaying = true
             lastTickTimestamp = Date()
+            let settled = resolvedPlayerTime(fallback: targetTime)
+            clock.currentTime = settled
+            updatePlaybackAnchor(mediaTime: settled)
             updateChordPollingTimer()
             updateNowPlayingInfo()
             onPlaybackStateChanged?(true, targetTime, duration)
@@ -898,10 +975,13 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
             accumulatedPlaySeconds = 0
             hasReportedEndForCurrentTrack = false
             lastTickTimestamp = Date()
+            clock.currentTime = 0
+            updatePlaybackAnchor(mediaTime: 0)
             resetChordAnalysis()
             await activePlayer.seek(to: .zero)
             activePlayer.playImmediately(atRate: playbackRate)
             isPlaying = true
+            updatePlaybackAnchor(mediaTime: 0)
             updateChordPollingTimer()
             updateNowPlayingInfo()
             onPlaybackStateChanged?(true, 0, duration)
@@ -920,6 +1000,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         // Queue reached the end with repeatMode == .off -> request radio tracks
         if let seedTrack = currentTrack, let onNeedRadioTracks {
             isBuffering = true
+            updatePlaybackAnchor()
             let radioTracks = await onNeedRadioTracks(seedTrack)
             let existingIds = Set(queue.map(\.id))
             let fresh = radioTracks.filter { !existingIds.contains($0.id) }
@@ -936,6 +1017,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         activePlayer.pause()
         isPlaying = false
         isBuffering = false
+        updatePlaybackAnchor()
         updateChordPollingTimer()
         updateNowPlayingInfo()
         onPlaybackStateChanged?(false, currentTime, duration)
@@ -1060,12 +1142,13 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
             self.activeAuthoritativeDuration = authDur
             self.hasTriggeredSafetyEndAdvance = false
             self.retriedTrackIds.remove(nextTrack.id)
-            self.currentTime = 0
+            self.clock.currentTime = 0
             self.duration = authDur ?? nextTrack.duration
             self.accumulatedPlaySeconds = 0
             self.hasReportedEndForCurrentTrack = false
             self.lastTickTimestamp = Date()
 
+            self.updatePlaybackAnchor(mediaTime: 0)
             self.updateChordPollingTimer()
             self.onTrackChanged?(nextTrack, preparedStream)
             self.onPlaybackStateChanged?(true, 0, self.duration)
@@ -1129,7 +1212,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
             timeObserverOwner = nil
         }
 
-        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
                 self?.handlePeriodicTime(time)
@@ -1145,7 +1228,10 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
                 switch status {
                 case .waitingToPlayAtSpecifiedRate:
                     if !self.isBuffering {
+                        let exactTime = self.resolvedPlayerTime(fallback: self.playbackAnchor.interpolatedTime())
+                        self.clock.currentTime = exactTime
                         self.isBuffering = true
+                        self.updatePlaybackAnchor(mediaTime: exactTime)
                         self.updateNowPlayingInfo()
                     }
                 case .playing:
@@ -1158,12 +1244,18 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
                         self.updateChordPollingTimer()
                     }
                     if wasBuffering || !wasPlaying {
+                        let exactTime = self.resolvedPlayerTime(fallback: self.clock.currentTime)
+                        self.clock.currentTime = exactTime
+                        self.updatePlaybackAnchor(mediaTime: exactTime)
                         self.updateNowPlayingInfo()
                     }
                 case .paused:
                     let wasBuffering = self.isBuffering
                     self.isBuffering = false
                     if wasBuffering {
+                        let exactTime = self.resolvedPlayerTime(fallback: self.clock.currentTime)
+                        self.clock.currentTime = exactTime
+                        self.updatePlaybackAnchor(mediaTime: exactTime)
                         self.updateNowPlayingInfo()
                     }
                 @unknown default:
@@ -1217,12 +1309,22 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
                     if let trackId = self.currentTrack?.id {
                         self.retriedTrackIds.remove(trackId)
                     }
-                    if self.activePlayer.timeControlStatus != .waitingToPlayAtSpecifiedRate {
+                    var anchorNeedsUpdate = false
+                    if self.activePlayer.timeControlStatus != .waitingToPlayAtSpecifiedRate && self.isBuffering {
                         self.isBuffering = false
+                        anchorNeedsUpdate = true
                     }
                     if let effective = self.effectiveDuration(fromItemDuration: CMTimeGetSeconds(observed.duration)) {
-                        self.duration = effective
+                        if abs(effective - self.duration) > 0.01 {
+                            self.duration = effective
+                            anchorNeedsUpdate = true
+                        }
                         self.updateNowPlayingInfo()
+                    }
+                    if anchorNeedsUpdate {
+                        let exactTime = self.resolvedPlayerTime(fallback: self.clock.currentTime)
+                        self.clock.currentTime = exactTime
+                        self.updatePlaybackAnchor(mediaTime: exactTime)
                     }
                 case .failed:
                     self.handlePlaybackFailure(
@@ -1257,6 +1359,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
             retriedTrackIds.insert(track.id)
             isBuffering = true
             lastError = nil
+            updatePlaybackAnchor()
 
             // If an addon lossless substitute failed for a YouTube track, fall back directly to YouTube.
             let wasAddonSubstituteForYouTube = (track.addonConfigId == nil)
@@ -1291,6 +1394,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
                     self.isBuffering = false
                     self.isPlaying = false
                     self.lastError = "Unable to play \"\(track.title)\": \(error.localizedDescription)"
+                    self.updatePlaybackAnchor()
                     self.updateChordPollingTimer()
                     self.updateNowPlayingInfo()
                     self.onPlaybackStateChanged?(false, self.currentTime, self.duration)
@@ -1302,25 +1406,66 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
         isBuffering = false
         isPlaying = false
         lastError = errorMessage
+        updatePlaybackAnchor()
         updateChordPollingTimer()
         updateNowPlayingInfo()
         onPlaybackStateChanged?(false, currentTime, duration)
     }
 
+    private func resolvedPlayerTime(fallback: TimeInterval) -> TimeInterval {
+        guard activePlayer.currentItem != nil else { return fallback }
+        let raw = CMTimeGetSeconds(activePlayer.currentTime())
+        guard raw.isFinite && raw >= 0 else { return fallback }
+        if let auth = activeAuthoritativeDuration, auth.isFinite, auth > 0 {
+            return min(raw, auth)
+        }
+        if duration.isFinite && duration > 0 {
+            return min(raw, duration)
+        }
+        return raw
+    }
+
+    private func updatePlaybackAnchor(mediaTime explicitTime: TimeInterval? = nil) {
+        let rawTime = explicitTime ?? clock.currentTime
+        let safeTime = rawTime.isFinite ? max(0, rawTime) : 0
+        let safeDuration = duration.isFinite ? max(0, duration) : 0
+        let clampedTime = safeDuration > 0 ? min(safeTime, safeDuration) : safeTime
+        let activelyPlaying = isPlaying && !isBuffering
+        let nextAnchor = PlaybackAnchor(
+            mediaTime: clampedTime,
+            hostTime: CACurrentMediaTime(),
+            rate: Double(playbackRate),
+            isPlaying: activelyPlaying,
+            duration: safeDuration
+        )
+        if playbackAnchor != nextAnchor {
+            playbackAnchor = nextAnchor
+        }
+    }
+
     private func handlePeriodicTime(_ time: CMTime) {
         let seconds = CMTimeGetSeconds(time)
+        var observedNewTime: TimeInterval?
         if seconds.isFinite && seconds >= 0 {
+            let clamped: TimeInterval
             if let auth = activeAuthoritativeDuration, auth.isFinite, auth > 0 {
-                currentTime = min(seconds, auth)
+                clamped = min(seconds, auth)
             } else {
-                currentTime = seconds
+                clamped = seconds
+            }
+            observedNewTime = clamped
+            if abs(clock.currentTime - clamped) >= 0.001 {
+                clock.currentTime = clamped
             }
         }
 
+        var didUpdateAnchorForDuration = false
         if let item = activePlayer.currentItem,
            let itemDuration = effectiveDuration(fromItemDuration: CMTimeGetSeconds(item.duration)),
            abs(itemDuration - duration) > 0.25 {
             duration = itemDuration
+            updatePlaybackAnchor(mediaTime: observedNewTime ?? clock.currentTime)
+            didUpdateAnchorForDuration = true
             updateNowPlayingInfo()
         }
 
@@ -1330,19 +1475,35 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
                     isLoopSeeking = true
                     let targetTime = loop.lowerBound
                     let target = CMTime(seconds: targetTime, preferredTimescale: 600)
-                    currentTime = targetTime
+                    clock.currentTime = targetTime
+                    updatePlaybackAnchor(mediaTime: targetTime)
                     resetChordAnalysis()
                     updateNowPlayingInfo()
                     activePlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
                         Task { @MainActor [weak self] in
                             guard let self else { return }
                             self.isLoopSeeking = false
+                            let settled = self.resolvedPlayerTime(fallback: targetTime)
+                            self.clock.currentTime = settled
+                            self.updatePlaybackAnchor(mediaTime: settled)
                             self.updateNowPlayingInfo()
                             self.onPlaybackStateChanged?(self.isPlaying, self.currentTime, self.duration)
                         }
                     }
                 }
                 return
+            }
+
+            if !didUpdateAnchorForDuration,
+               !isLoopSeeking,
+               let newTime = observedNewTime {
+                let nowHost = CACurrentMediaTime()
+                let expectedPlaying = isPlaying && !isBuffering
+                if playbackAnchor.isPlaying != expectedPlaying
+                    || abs(playbackAnchor.rate - Double(playbackRate)) > 0.001
+                    || abs(playbackAnchor.interpolatedTime(atHostTime: nowHost) - newTime) > 0.045 {
+                    updatePlaybackAnchor(mediaTime: newTime)
+                }
             }
 
             let now = Date()
@@ -1739,10 +1900,19 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
     public func resetChordAnalysis() {
         chordResetGeneration &+= 1
         chordDetector.reset()
-        currentChord = nil
-        chordHistory = []
-        detectedKey = nil
-        chromaVector = Array(repeating: 0, count: 12)
+        if currentChord != nil {
+            currentChord = nil
+        }
+        if !chordHistory.isEmpty {
+            chordHistory = []
+        }
+        if detectedKey != nil {
+            detectedKey = nil
+        }
+        let zeroChroma = Array(repeating: Float(0), count: 12)
+        if clock.chromaVector != zeroChroma {
+            clock.chromaVector = zeroChroma
+        }
     }
 
     private func updateChordPollingTimer() {
@@ -1764,7 +1934,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
 
     private func pollChordAnalysis() {
         guard isPlaying, !chordAnalysisInFlight, !(currentStreamInfo?.isHLS ?? false) else { return }
-        let timestamp = currentTime
+        let timestamp = isBuffering ? clock.currentTime : playbackAnchor.interpolatedTime()
         let simpleMode = chordSimpleMode
         let generation = chordResetGeneration
         let detector = chordDetector
@@ -1782,8 +1952,8 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
     }
 
     private func applyChordSnapshot(_ snapshot: ChordAnalysisSnapshot) {
-        if snapshot.chroma.count == 12 {
-            chromaVector = snapshot.chroma
+        if isPlaying, snapshot.chroma.count == 12, clock.chromaVector != snapshot.chroma {
+            clock.chromaVector = snapshot.chroma
         }
         if snapshot.detectedKey != detectedKey {
             detectedKey = snapshot.detectedKey
@@ -1791,7 +1961,7 @@ public final class AudioEngine: ObservableObject, AudioPlayerProtocol {
 
         if let chord = snapshot.chord {
             let changedChord = currentChord?.root != chord.root || currentChord?.quality != chord.quality
-            if changedChord || abs((currentChord?.confidence ?? 0) - chord.confidence) >= 0.04 {
+            if changedChord && chord != currentChord {
                 currentChord = chord
             }
 

@@ -3,11 +3,9 @@ import SwiftUI
 public struct FloatingPlayerBar: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var isHoveringArtwork = false
-    @State private var isHoveringScrubber = false
-    @State private var isScrubbing = false
-    @State private var scrubTime: TimeInterval = 0
 
     public init() {}
 
@@ -17,19 +15,6 @@ public struct FloatingPlayerBar: View {
     private var secondaryText: Color { SoundChordTheme.secondaryText(for: colorScheme) }
     private var audio: AudioEngine { appState.audioEngine }
     private var track: Track? { audio.currentTrack }
-
-    private var effectiveDuration: TimeInterval {
-        max(audio.duration, track?.duration ?? 0)
-    }
-
-    private var displayedTime: TimeInterval {
-        isScrubbing ? scrubTime : audio.currentTime
-    }
-
-    private var progress: Double {
-        guard effectiveDuration > 0 else { return 0 }
-        return min(1, max(0, displayedTime / effectiveDuration))
-    }
 
     public var body: some View {
         if isDark {
@@ -95,8 +80,12 @@ public struct FloatingPlayerBar: View {
                 }
                 .buttonStyle(.plain)
                 .onHover { hovering in
-                    withAnimation(.easeOut(duration: 0.12)) {
+                    if reduceMotion {
                         isHoveringArtwork = hovering
+                    } else {
+                        withAnimation(.easeOut(duration: 0.11)) {
+                            isHoveringArtwork = hovering
+                        }
                     }
                 }
                 .help("Open Full-Screen Player (⌘⇧F)")
@@ -227,19 +216,15 @@ public struct FloatingPlayerBar: View {
                 }
             }
 
-            HStack(spacing: 8) {
-                Text(track == nil ? "0:00" : Track.formatTime(displayedTime))
-                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
-                    .foregroundStyle(secondaryText)
-                    .frame(minWidth: 34, alignment: .trailing)
-
-                scrubberTrack
-
-                Text(track == nil ? "0:00" : "-\(Track.formatTime(max(0, effectiveDuration - displayedTime)))")
-                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
-                    .foregroundStyle(secondaryText)
-                    .frame(minWidth: 38, alignment: .leading)
-            }
+            HighRefreshScrubberView(
+                anchor: audio.playbackAnchor,
+                hasTrack: track != nil,
+                fallbackDuration: track?.duration ?? 0,
+                style: .spotifyDark,
+                onSeek: { target in
+                    audio.seek(to: target)
+                }
+            )
         }
     }
 
@@ -368,8 +353,12 @@ public struct FloatingPlayerBar: View {
                     }
                     .buttonStyle(.plain)
                     .onHover { hovering in
-                        withAnimation(.easeOut(duration: 0.12)) {
+                        if reduceMotion {
                             isHoveringArtwork = hovering
+                        } else {
+                            withAnimation(.easeOut(duration: 0.11)) {
+                                isHoveringArtwork = hovering
+                            }
                         }
                     }
                     .help("Open Full-Screen Player (⌘⇧F)")
@@ -428,19 +417,15 @@ public struct FloatingPlayerBar: View {
                             .help(liked ? "Remove from Liked Songs" : "Like Song")
                         }
 
-                        HStack(spacing: 6) {
-                            Text(Track.formatTime(displayedTime))
-                                .font(.system(size: 9.5, weight: .medium).monospacedDigit())
-                                .foregroundStyle(secondaryText)
-                                .frame(minWidth: 28, alignment: .leading)
-
-                            scrubberTrack
-
-                            Text("-\(Track.formatTime(max(0, effectiveDuration - displayedTime)))")
-                                .font(.system(size: 9.5, weight: .medium).monospacedDigit())
-                                .foregroundStyle(secondaryText)
-                                .frame(minWidth: 32, alignment: .trailing)
-                        }
+                        HighRefreshScrubberView(
+                            anchor: audio.playbackAnchor,
+                            hasTrack: true,
+                            fallbackDuration: track.duration,
+                            style: .appleLight,
+                            onSeek: { target in
+                                audio.seek(to: target)
+                            }
+                        )
                     }
                 }
             } else {
@@ -494,59 +479,6 @@ public struct FloatingPlayerBar: View {
         .popover(isPresented: $appState.showStatsForNerds, arrowEdge: .top) {
             StatsForNerdsPopoverView()
                 .environmentObject(appState)
-        }
-    }
-
-    private var scrubberTrack: some View {
-        GeometryReader { geo in
-            let width = max(1, geo.size.width)
-            let barHeight: CGFloat = (isHoveringScrubber || isScrubbing) ? 5 : 3.5
-
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(isDark ? Color.white.opacity(0.20) : Color.black.opacity(0.14))
-                    .frame(height: barHeight)
-
-                Capsule()
-                    .fill(isHoveringScrubber || isScrubbing ? accent : (isDark ? Color.white : primaryText.opacity(0.78)))
-                    .frame(width: max(0, width * progress), height: barHeight)
-
-                if isHoveringScrubber || isScrubbing {
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: 10, height: 10)
-                        .shadow(color: Color.black.opacity(0.35), radius: 2, y: 1)
-                        .offset(x: max(0, min(width - 10, width * progress - 5)))
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        guard effectiveDuration > 0 else { return }
-                        isScrubbing = true
-                        let frac = min(1, max(0, value.location.x / width))
-                        scrubTime = frac * effectiveDuration
-                    }
-                    .onEnded { value in
-                        guard effectiveDuration > 0 else {
-                            isScrubbing = false
-                            return
-                        }
-                        let frac = min(1, max(0, value.location.x / width))
-                        let target = frac * effectiveDuration
-                        scrubTime = target
-                        audio.seek(to: target)
-                        isScrubbing = false
-                    }
-            )
-        }
-        .frame(height: 12)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.12)) {
-                isHoveringScrubber = hovering
-            }
         }
     }
 
@@ -698,6 +630,207 @@ public struct FloatingPlayerBar: View {
     }
 }
 
+// MARK: - High-Refresh Playback Timeline & GPU Scrubber
+
+struct PlaybackTimeline<Content: View>: View {
+    let anchor: PlaybackAnchor
+    let isPaused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ViewBuilder let content: (TimeInterval) -> Content
+
+    init(
+        anchor: PlaybackAnchor,
+        isPaused: Bool = false,
+        @ViewBuilder content: @escaping (TimeInterval) -> Content
+    ) {
+        self.anchor = anchor
+        self.isPaused = isPaused
+        self.content = content
+    }
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: reduceMotion ? 0.5 : nil, paused: isPaused || !anchor.isPlaying)) { _ in
+            content(anchor.interpolatedTime())
+        }
+    }
+}
+
+struct HighRefreshScrubberView: View {
+    enum Style {
+        case spotifyDark
+        case appleLight
+        case fullScreen
+    }
+
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    let anchor: PlaybackAnchor
+    let hasTrack: Bool
+    let fallbackDuration: TimeInterval
+    let style: Style
+    let onSeek: (TimeInterval) -> Void
+
+    @State private var isHoveringScrubber = false
+    @State private var isScrubbing = false
+    @State private var scrubTime: TimeInterval = 0
+
+    private var effectiveDuration: TimeInterval {
+        max(anchor.duration, fallbackDuration)
+    }
+
+    var body: some View {
+        PlaybackTimeline(anchor: anchor, isPaused: isScrubbing) { liveTime in
+            let displayedTime = isScrubbing ? scrubTime : liveTime
+            let progress: Double = {
+                guard effectiveDuration > 0 else { return 0 }
+                return min(1, max(0, displayedTime / effectiveDuration))
+            }()
+
+            scrubberLayout(displayedTime: displayedTime, progress: progress)
+        }
+    }
+
+    @ViewBuilder
+    private func scrubberLayout(displayedTime: TimeInterval, progress: Double) -> some View {
+        switch style {
+        case .spotifyDark:
+            let secondary = SoundChordTheme.secondaryText(for: .dark)
+            HStack(spacing: 8) {
+                Text(hasTrack ? Track.formatTime(displayedTime) : "0:00")
+                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(secondary)
+                    .frame(minWidth: 34, alignment: .trailing)
+
+                scrubberTrack(progress: progress)
+
+                Text(hasTrack ? "-\(Track.formatTime(max(0, effectiveDuration - displayedTime)))" : "0:00")
+                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(secondary)
+                    .frame(minWidth: 38, alignment: .leading)
+            }
+
+        case .appleLight:
+            let secondary = SoundChordTheme.secondaryText(for: .light)
+            HStack(spacing: 6) {
+                Text(Track.formatTime(displayedTime))
+                    .font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(secondary)
+                    .frame(minWidth: 28, alignment: .leading)
+
+                scrubberTrack(progress: progress)
+
+                Text("-\(Track.formatTime(max(0, effectiveDuration - displayedTime)))")
+                    .font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(secondary)
+                    .frame(minWidth: 32, alignment: .trailing)
+            }
+
+        case .fullScreen:
+            VStack(spacing: 6) {
+                scrubberTrack(progress: progress)
+
+                HStack {
+                    Text(Track.formatTime(displayedTime))
+                        .font(.system(size: 11.5, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.72))
+
+                    Spacer()
+
+                    Text("-\(Track.formatTime(max(0, effectiveDuration - displayedTime)))")
+                        .font(.system(size: 11.5, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.72))
+                }
+            }
+        }
+    }
+
+    private func scrubberTrack(progress: Double) -> some View {
+        let isActive = isHoveringScrubber || isScrubbing
+        let barHeight: CGFloat = {
+            switch style {
+            case .fullScreen: return isActive ? 7 : 5
+            case .spotifyDark, .appleLight: return isActive ? 5 : 3.5
+            }
+        }()
+        let containerHeight: CGFloat = style == .fullScreen ? 16 : 12
+        let knobSize: CGFloat = style == .fullScreen ? 13 : 10
+        let trackTint: Color = {
+            switch style {
+            case .fullScreen: return Color.white.opacity(0.22)
+            case .spotifyDark: return Color.white.opacity(0.20)
+            case .appleLight: return Color.black.opacity(0.14)
+            }
+        }()
+        let fillTint: Color = {
+            switch style {
+            case .fullScreen:
+                return Color.white.opacity(0.95)
+            case .spotifyDark:
+                return isActive ? SoundChordTheme.accentColor(for: .dark) : Color.white
+            case .appleLight:
+                return isActive ? SoundChordTheme.accentColor(for: .light) : SoundChordTheme.primaryText(for: .light).opacity(0.78)
+            }
+        }()
+
+        return GeometryReader { geo in
+            let width = max(1, geo.size.width)
+
+            ZStack(alignment: .leading) {
+                ZStack(alignment: .leading) {
+                    Rectangle()
+                        .fill(trackTint)
+                    Rectangle()
+                        .fill(fillTint)
+                        .scaleEffect(x: CGFloat(progress), y: 1.0, anchor: .leading)
+                }
+                .frame(height: barHeight)
+                .clipShape(Capsule())
+
+                if isActive {
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: knobSize, height: knobSize)
+                        .shadow(color: Color.black.opacity(style == .fullScreen ? 0.45 : 0.35), radius: style == .fullScreen ? 4 : 2, y: 1)
+                        .offset(x: max(0, min(width - knobSize, width * progress - knobSize * 0.5)))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        guard effectiveDuration > 0 else { return }
+                        isScrubbing = true
+                        let frac = min(1, max(0, value.location.x / width))
+                        scrubTime = frac * effectiveDuration
+                    }
+                    .onEnded { value in
+                        guard effectiveDuration > 0 else {
+                            isScrubbing = false
+                            return
+                        }
+                        let frac = min(1, max(0, value.location.x / width))
+                        let target = frac * effectiveDuration
+                        scrubTime = target
+                        onSeek(target)
+                        isScrubbing = false
+                    }
+            )
+        }
+        .frame(height: containerHeight)
+        .onHover { hovering in
+            if reduceMotion {
+                isHoveringScrubber = hovering
+            } else {
+                withAnimation(.easeOut(duration: 0.11)) {
+                    isHoveringScrubber = hovering
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Compact Interactive Volume Slider
 
 struct CompactVolumeSlider: View {
@@ -705,6 +838,7 @@ struct CompactVolumeSlider: View {
     var trackTint: Color = Color.primary.opacity(0.16)
     var fillTint: Color = Color.primary.opacity(0.82)
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
 
     var body: some View {
@@ -714,13 +848,15 @@ struct CompactVolumeSlider: View {
             let barHeight: CGFloat = isHovering ? 4.5 : 3
 
             ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(trackTint)
-                    .frame(height: barHeight)
-
-                Capsule()
-                    .fill(fillTint)
-                    .frame(width: width * clamped, height: barHeight)
+                ZStack(alignment: .leading) {
+                    Rectangle()
+                        .fill(trackTint)
+                    Rectangle()
+                        .fill(fillTint)
+                        .scaleEffect(x: CGFloat(clamped), y: 1.0, anchor: .leading)
+                }
+                .frame(height: barHeight)
+                .clipShape(Capsule())
 
                 if isHovering {
                     Circle()
@@ -740,8 +876,12 @@ struct CompactVolumeSlider: View {
             )
         }
         .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.12)) {
+            if reduceMotion {
                 isHovering = hovering
+            } else {
+                withAnimation(.easeOut(duration: 0.11)) {
+                    isHovering = hovering
+                }
             }
         }
     }

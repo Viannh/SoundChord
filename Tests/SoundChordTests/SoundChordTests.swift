@@ -1,3 +1,4 @@
+import Combine
 import Darwin
 import Foundation
 import MediaPlayer
@@ -2611,5 +2612,83 @@ struct BitChordStorageMigrationTests {
         #expect(migratedAddons.addons.count == 1)
         #expect(migratedAddons.addons.first?.id == "legacy-res")
         #expect(migratedAddons.addons.first?.name == "Legacy Resonance")
+    }
+
+    @Test("PlaybackAnchor interpolates smoothly at 1.0x and 1.5x, clamps to duration, and freezes when paused")
+    func testPlaybackAnchorInterpolation() {
+        let anchor1x = PlaybackAnchor(
+            mediaTime: 10.0,
+            hostTime: 100.0,
+            rate: 1.0,
+            isPlaying: true,
+            duration: 120.0
+        )
+        #expect(abs(anchor1x.interpolatedTime(atHostTime: 100.0) - 10.0) < 1e-9)
+        #expect(abs(anchor1x.interpolatedTime(atHostTime: 102.5) - 12.5) < 1e-9)
+        #expect(abs(anchor1x.interpolatedTime(atHostTime: 95.0) - 10.0) < 1e-9)
+        #expect(abs(anchor1x.interpolatedTime(atHostTime: 250.0) - 120.0) < 1e-9)
+
+        let anchor15x = PlaybackAnchor(
+            mediaTime: 10.0,
+            hostTime: 100.0,
+            rate: 1.5,
+            isPlaying: true,
+            duration: 120.0
+        )
+        #expect(abs(anchor15x.interpolatedTime(atHostTime: 104.0) - 16.0) < 1e-9)
+        #expect(abs(anchor15x.interpolatedTime(atHostTime: 200.0) - 120.0) < 1e-9)
+
+        let pausedAnchor = PlaybackAnchor(
+            mediaTime: 42.25,
+            hostTime: 100.0,
+            rate: 1.0,
+            isPlaying: false,
+            duration: 120.0
+        )
+        #expect(abs(pausedAnchor.interpolatedTime(atHostTime: 100.0) - 42.25) < 1e-9)
+        #expect(abs(pausedAnchor.interpolatedTime(atHostTime: 150.0) - 42.25) < 1e-9)
+    }
+
+    @Test("PlaybackClock mutations do not fire AppState.objectWillChange")
+    @MainActor
+    func testPlaybackClockIsolationFromAppStateObjectWillChange() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("soundchord_clock_test_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let libraryStore = LibraryStore(baseDirectory: tempDir)
+        let addonManager = AddonManager(baseDirectory: tempDir)
+        let engine = AudioEngine(streamResolver: StubStreamResolver())
+        let appState = AppState(
+            libraryStore: libraryStore,
+            addonManager: addonManager,
+            audioEngine: engine
+        )
+
+        var appStateEmissions = 0
+        var audioEngineEmissions = 0
+        var clockEmissions = 0
+
+        let appSub = appState.objectWillChange.sink { _ in appStateEmissions += 1 }
+        let engineSub = engine.objectWillChange.sink { _ in audioEngineEmissions += 1 }
+        let clockSub = engine.clock.objectWillChange.sink { _ in clockEmissions += 1 }
+        defer {
+            appSub.cancel()
+            engineSub.cancel()
+            clockSub.cancel()
+        }
+
+        engine.clock.currentTime = 1.25
+        engine.clock.currentTime = 2.50
+        engine.clock.currentTime = 3.75
+        let sampleChroma: [Float] = [0.9, 0.1, 0.0, 0.2, 0.8, 0.0, 0.0, 0.7, 0.0, 0.1, 0.0, 0.0]
+        engine.clock.chromaVector = sampleChroma
+
+        #expect(engine.currentTime == 3.75)
+        #expect(engine.chromaVector == sampleChroma)
+        #expect(clockEmissions == 4)
+        #expect(audioEngineEmissions == 0)
+        #expect(appStateEmissions == 0)
     }
 }

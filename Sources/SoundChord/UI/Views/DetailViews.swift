@@ -26,7 +26,7 @@ public struct AlbumDetailView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 24) {
                 if let current = displayedAlbum {
                     albumHeroHeader(current)
 
@@ -89,6 +89,7 @@ public struct AlbumDetailView: View {
                         .opacity(0.32)
                         .scaleEffect(0.90)
                         .offset(y: 12)
+                        .drawingGroup()
 
                     ArtworkImage(url: item.artworkURL, size: 220, cornerRadius: SoundChordTheme.cornerRadiusCard)
                         .shadow(color: .black.opacity(0.36), radius: 18, y: 8)
@@ -337,7 +338,7 @@ public struct ArtistDetailView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 30) {
+            LazyVStack(alignment: .leading, spacing: 30) {
                 if let current = displayedArtist {
                     artistHeroHeader(current)
 
@@ -624,7 +625,7 @@ public struct PlaylistDetailView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 24) {
                 if let current = displayedPlaylist {
                     playlistHeroHeader(current)
 
@@ -705,6 +706,7 @@ public struct PlaylistDetailView: View {
                         .opacity(0.32)
                         .scaleEffect(0.90)
                         .offset(y: 12)
+                        .drawingGroup()
 
                     ArtworkImage(url: artworkURL, size: 220, cornerRadius: SoundChordTheme.cornerRadiusCard)
                         .shadow(color: .black.opacity(0.36), radius: 18, y: 8)

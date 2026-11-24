@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 
 // MARK: - SoundChord 2-Direction Design System (Apple Music Light + Spotify Dark)
@@ -171,10 +172,10 @@ public struct VisualEffectBlur: NSViewRepresentable {
 final class ArtworkImageCache: @unchecked Sendable {
     static let shared = ArtworkImageCache()
 
-    private let cache: NSCache<NSURL, NSImage> = {
-        let c = NSCache<NSURL, NSImage>()
-        c.countLimit = 400
-        c.totalCostLimit = 128 * 1024 * 1024
+    private let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 600
+        c.totalCostLimit = 96 * 1024 * 1024
         return c
     }()
 
@@ -189,37 +190,82 @@ final class ArtworkImageCache: @unchecked Sendable {
         return URLSession(configuration: config)
     }()
 
-    func cachedImage(for url: URL) -> NSImage? {
-        cache.object(forKey: url as NSURL)
+    static func bucketedPixelSize(for requestedPixelSize: Int) -> Int {
+        let clamped = max(64, requestedPixelSize)
+        if clamped <= 96 { return 96 }
+        if clamped <= 192 { return 192 }
+        if clamped <= 420 { return 420 }
+        return 1024
+    }
+
+    private static func cacheKey(for url: URL, bucket: Int) -> NSString {
+        "\(url.absoluteString)#\(bucket)" as NSString
+    }
+
+    func cachedImage(for url: URL, targetPixelSize: Int = 420) -> NSImage? {
+        let bucket = Self.bucketedPixelSize(for: targetPixelSize)
+        return cache.object(forKey: Self.cacheKey(for: url, bucket: bucket))
     }
 
     @MainActor
-    func loadImage(from url: URL) async -> NSImage? {
-        if let existing = cache.object(forKey: url as NSURL) {
+    func loadImage(from url: URL, targetPixelSize: Int = 420) async -> NSImage? {
+        let bucket = Self.bucketedPixelSize(for: targetPixelSize)
+        let key = Self.cacheKey(for: url, bucket: bucket)
+        if let existing = cache.object(forKey: key) {
             return existing
         }
 
         do {
-            let data: Data
+            let decoded: (cgImage: CGImage, cost: Int)?
             if url.isFileURL {
-                data = try await Task.detached(priority: .utility) {
-                    try Data(contentsOf: url)
+                decoded = try await Task.detached(priority: .userInitiated) {
+                    let data = try Data(contentsOf: url)
+                    return Self.decodeThumbnailCGImage(from: data, targetPixelSize: bucket)
                 }.value
             } else {
                 let (fetched, response) = try await session.data(from: url)
                 if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                     return nil
                 }
-                data = fetched
+                decoded = await Task.detached(priority: .userInitiated) {
+                    Self.decodeThumbnailCGImage(from: fetched, targetPixelSize: bucket)
+                }.value
             }
 
-            guard let image = NSImage(data: data) else { return nil }
-            let pixelCost = Int(image.size.width * image.size.height * 4)
-            cache.setObject(image, forKey: url as NSURL, cost: max(1, pixelCost))
+            guard let (cgImage, pixelCost) = decoded else { return nil }
+            let pointSize = NSSize(
+                width: CGFloat(cgImage.width) / 2.0,
+                height: CGFloat(cgImage.height) / 2.0
+            )
+            let image = NSImage(cgImage: cgImage, size: pointSize)
+            cache.setObject(image, forKey: key, cost: max(1, pixelCost))
             return image
         } catch {
             return nil
         }
+    }
+
+    private nonisolated static func decodeThumbnailCGImage(from data: Data, targetPixelSize: Int) -> (CGImage, Int)? {
+        let sourceOptions: [CFString: Any] = [
+            kCGImageSourceShouldCache: false
+        ]
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary) else {
+            return nil
+        }
+        let maxPixels = max(64, targetPixelSize)
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary),
+              cgImage.width > 0,
+              cgImage.height > 0 else {
+            return nil
+        }
+        let pixelCost = cgImage.width * cgImage.height * 4
+        return (cgImage, pixelCost)
     }
 }
 
@@ -231,7 +277,23 @@ public struct ArtworkImage: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var loadedImage: NSImage?
-    @State private var loadedURL: URL?
+    @State private var loadedKey: ArtworkLoadKey?
+
+    private struct ArtworkLoadKey: Hashable {
+        let url: URL?
+        let bucket: Int
+    }
+
+    private var targetPixelSize: Int {
+        Int(ceil(size * 2.0))
+    }
+
+    private var currentKey: ArtworkLoadKey {
+        ArtworkLoadKey(
+            url: url,
+            bucket: ArtworkImageCache.bucketedPixelSize(for: targetPixelSize)
+        )
+    }
 
     public init(
         url: URL?,
@@ -243,9 +305,14 @@ public struct ArtworkImage: View {
         self.size = size
         self.cornerRadius = cornerRadius
         self.isCircle = isCircle
-        if let url, let cached = ArtworkImageCache.shared.cachedImage(for: url) {
+        let pixelSize = Int(ceil(size * 2.0))
+        if let url, let cached = ArtworkImageCache.shared.cachedImage(for: url, targetPixelSize: pixelSize) {
+            let key = ArtworkLoadKey(
+                url: url,
+                bucket: ArtworkImageCache.bucketedPixelSize(for: pixelSize)
+            )
             _loadedImage = State(initialValue: cached)
-            _loadedURL = State(initialValue: url)
+            _loadedKey = State(initialValue: key)
         }
     }
 
@@ -265,17 +332,17 @@ public struct ArtworkImage: View {
         .frame(width: size, height: size)
         .clipShape(clipShape)
         .overlay(borderOverlay)
-        .task(id: url) {
+        .task(id: currentKey) {
             await fetchIfNeeded()
         }
     }
 
     private var displayedImage: NSImage? {
         guard let url else { return nil }
-        if loadedURL == url, let loadedImage {
+        if loadedKey == currentKey, let loadedImage {
             return loadedImage
         }
-        return ArtworkImageCache.shared.cachedImage(for: url)
+        return ArtworkImageCache.shared.cachedImage(for: url, targetPixelSize: targetPixelSize)
     }
 
     private var placeholderView: some View {
@@ -307,22 +374,24 @@ public struct ArtworkImage: View {
     }
 
     private func fetchIfNeeded() async {
+        let key = currentKey
         guard let url else {
             loadedImage = nil
-            loadedURL = nil
+            loadedKey = nil
             return
         }
-        if let cached = ArtworkImageCache.shared.cachedImage(for: url) {
+        let pixelSize = targetPixelSize
+        if let cached = ArtworkImageCache.shared.cachedImage(for: url, targetPixelSize: pixelSize) {
             loadedImage = cached
-            loadedURL = url
+            loadedKey = key
             return
         }
-        let fetched = await ArtworkImageCache.shared.loadImage(from: url)
+        let fetched = await ArtworkImageCache.shared.loadImage(from: url, targetPixelSize: pixelSize)
         guard !Task.isCancelled else { return }
         if let fetched {
             withAnimation(.easeOut(duration: 0.22)) {
                 loadedImage = fetched
-                loadedURL = url
+                loadedKey = key
             }
         }
     }
@@ -364,20 +433,30 @@ struct MiniEqualizerBars: View {
     let isPlaying: Bool
     var tint: Color = SoundChordTheme.accentColor
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: !isPlaying)) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
+        let shouldAnimate = isPlaying && !reduceMotion
+        TimelineView(.animation(paused: !shouldAnimate)) { timeline in
+            let t = shouldAnimate ? timeline.date.timeIntervalSinceReferenceDate : 0.0
             HStack(alignment: .bottom, spacing: 2) {
-                bar(phase: t * 5.2 + 0.0)
-                bar(phase: t * 6.8 + 1.4)
-                bar(phase: t * 4.5 + 2.7)
+                bar(phase: t * 5.2 + 0.0, staticPlayingHeight: 6.5)
+                bar(phase: t * 6.8 + 1.4, staticPlayingHeight: 11.5)
+                bar(phase: t * 4.5 + 2.7, staticPlayingHeight: 8.0)
             }
             .frame(width: 13, height: 13, alignment: .bottom)
         }
     }
 
-    private func bar(phase: Double) -> some View {
-        let height: CGFloat = isPlaying ? CGFloat(4.0 + 9.0 * (0.5 + 0.5 * sin(phase))) : 3.5
+    private func bar(phase: Double, staticPlayingHeight: CGFloat) -> some View {
+        let height: CGFloat
+        if !isPlaying {
+            height = 3.5
+        } else if reduceMotion {
+            height = staticPlayingHeight
+        } else {
+            height = CGFloat(4.0 + 9.0 * (0.5 + 0.5 * sin(phase)))
+        }
         return RoundedRectangle(cornerRadius: 1, style: .continuous)
             .fill(tint)
             .frame(width: 3, height: height)

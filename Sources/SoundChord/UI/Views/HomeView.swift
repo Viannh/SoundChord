@@ -22,78 +22,83 @@ struct BCWaveformBars: View {
     var color: Color = SoundChordTheme.accentColor
     var height: CGFloat = 14
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var animate = false
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 2) {
             ForEach(0..<3, id: \.self) { idx in
+                let activeScale: CGFloat = isPlaying
+                    ? (reduceMotion ? 0.65 : (animate ? barMaxScale(idx) : barMinScale(idx)))
+                    : 0.35
+
                 RoundedRectangle(cornerRadius: 1, style: .continuous)
                     .fill(color)
-                    .frame(
-                        width: 2.5,
-                        height: isPlaying
-                            ? (animate ? barMaxHeight(idx) : barMinHeight(idx))
-                            : height * 0.35
-                    )
+                    .frame(width: 2.5, height: height)
+                    .scaleEffect(x: 1.0, y: activeScale, anchor: .bottom)
                     .animation(
-                        isPlaying
+                        isPlaying && !reduceMotion
                             ? .easeInOut(duration: 0.42 + Double(idx) * 0.14).repeatForever(autoreverses: true)
-                            : .easeOut(duration: 0.2),
+                            : (reduceMotion ? nil : .easeOut(duration: 0.12)),
                         value: animate
                     )
             }
         }
         .frame(width: 14, height: height, alignment: .bottom)
         .onAppear {
-            if isPlaying { animate = true }
+            if isPlaying && !reduceMotion { animate = true }
         }
         .onChange(of: isPlaying) { _, playing in
-            animate = playing
+            animate = playing && !reduceMotion
         }
     }
 
-    private func barMaxHeight(_ index: Int) -> CGFloat {
+    private func barMaxScale(_ index: Int) -> CGFloat {
         switch index {
-        case 0: return height * 0.95
-        case 1: return height * 0.65
-        default: return height * 0.85
+        case 0: return 0.95
+        case 1: return 0.65
+        default: return 0.85
         }
     }
 
-    private func barMinHeight(_ index: Int) -> CGFloat {
+    private func barMinScale(_ index: Int) -> CGFloat {
         switch index {
-        case 0: return height * 0.25
-        case 1: return height * 0.92
-        default: return height * 0.32
+        case 0: return 0.25
+        case 1: return 0.92
+        default: return 0.32
         }
     }
 }
 
 struct BCShimmerBox: View {
     var cornerRadius: CGFloat = 8
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var shimmerPhase: CGFloat = -1.0
 
     var body: some View {
         GeometryReader { geo in
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(Color.primary.opacity(0.08))
-                .overlay(
-                    LinearGradient(
-                        colors: [
-                            Color.clear,
-                            Color.white.opacity(0.14),
-                            Color.clear
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .frame(width: max(60, geo.size.width * 0.65))
-                    .offset(x: shimmerPhase * geo.size.width * 1.4)
-                )
+                .overlay {
+                    if !reduceMotion {
+                        LinearGradient(
+                            colors: [
+                                Color.clear,
+                                Color.white.opacity(0.14),
+                                Color.clear
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                        .frame(width: max(60, geo.size.width * 0.65))
+                        .offset(x: shimmerPhase * geo.size.width * 1.4)
+                    }
+                }
                 .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         }
         .onAppear {
+            guard !reduceMotion else { return }
             withAnimation(.linear(duration: 1.35).repeatForever(autoreverses: false)) {
                 shimmerPhase = 1.2
             }
@@ -270,6 +275,7 @@ struct BCEmptyStateView: View {
 struct BCSquareCard: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let item: ShelfItem
     var size: CGFloat = 184
 
@@ -285,11 +291,11 @@ struct BCSquareCard: View {
         return VStack(alignment: .leading, spacing: 6) {
             ZStack {
                 ArtworkImage(url: item.artworkURL, size: size, cornerRadius: SoundChordTheme.cornerRadiusCard, isCircle: false)
-                    .shadow(color: Color.black.opacity(isHovered ? 0.30 : 0.16), radius: isHovered ? 10 : 5, y: isHovered ? 5 : 2)
+                    .shadow(color: Color.black.opacity(0.18), radius: 6, y: 3)
 
                 RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous)
                     .fill(Color.black.opacity(isHovered ? 0.28 : 0.0))
-                    .animation(.easeInOut(duration: 0.14), value: isHovered)
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.11), value: isHovered)
 
                 if isHovered || isResolvingPlay {
                     VStack {
@@ -369,8 +375,12 @@ struct BCSquareCard: View {
         }
         .frame(width: size)
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.14)) {
+            if reduceMotion {
                 isHovered = hovering
+            } else {
+                withAnimation(.easeOut(duration: 0.11)) {
+                    isHovered = hovering
+                }
             }
         }
         .contextMenu {
@@ -496,6 +506,7 @@ struct BCSquareCard: View {
 
 struct BCArtistCircleCard: View {
     @EnvironmentObject var appState: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let artist: Artist
     var size: CGFloat = 124
 
@@ -511,8 +522,8 @@ struct BCArtistCircleCard: View {
                         Circle()
                             .strokeBorder(Color.white.opacity(isHovered ? 0.30 : 0.12), lineWidth: 1)
                     )
-                    .shadow(color: Color.black.opacity(isHovered ? 0.35 : 0.18), radius: isHovered ? 10 : 5, y: 4)
-                    .scaleEffect(isHovered ? 1.03 : 1.0)
+                    .shadow(color: Color.black.opacity(0.20), radius: 6, y: 4)
+                    .scaleEffect(isHovered && !reduceMotion ? 1.03 : 1.0)
 
                 VStack(spacing: 2) {
                     Text(artist.name)
@@ -531,8 +542,12 @@ struct BCArtistCircleCard: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.16)) {
+            if reduceMotion {
                 isHovered = hovering
+            } else {
+                withAnimation(.easeOut(duration: 0.11)) {
+                    isHovered = hovering
+                }
             }
         }
     }
@@ -663,6 +678,7 @@ struct BCQuickPickRow: View {
 struct BCHeroCard: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let item: ShelfItem
     @State private var isHovered = false
 
@@ -713,8 +729,8 @@ struct BCHeroCard: View {
                 RoundedRectangle(cornerRadius: SoundChordTheme.cornerRadiusCard, style: .continuous)
                     .strokeBorder(border, lineWidth: 1)
             )
-            .shadow(color: .black.opacity(isHovered ? 0.28 : 0.14), radius: isHovered ? 10 : 5, y: 3)
-            .scaleEffect(isHovered ? 1.01 : 1.0)
+            .shadow(color: .black.opacity(0.18), radius: 6, y: 3)
+            .scaleEffect(isHovered && !reduceMotion ? 1.01 : 1.0)
         }
         .frame(width: 340)
         .contentShape(Rectangle())
@@ -727,8 +743,12 @@ struct BCHeroCard: View {
             }
         }
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
+            if reduceMotion {
                 isHovered = hovering
+            } else {
+                withAnimation(.easeOut(duration: 0.11)) {
+                    isHovered = hovering
+                }
             }
         }
     }
@@ -1314,7 +1334,7 @@ public struct ShelfDetailView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
+            LazyVStack(alignment: .leading, spacing: 22) {
                 HStack(alignment: .bottom) {
                     VStack(alignment: .leading, spacing: 4) {
                         if let subtitle = shelf.subtitle, !subtitle.isEmpty {
